@@ -1,0 +1,14 @@
+# Xmake cache
+.xmake/
+build/
+/build-*/
+/cmake-build-*/
+
+# Local IDE state and machine-specific toolchain paths
+/.idea/
+/.vscode/
+
+# MacOS Cache
+.DS_Store
+
+
