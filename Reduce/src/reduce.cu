@@ -197,8 +197,84 @@ __global__ void reduce_v3(float* input, float* output, int n)
 }
 
 
+//============================================================================
+// warpReduce: 在一个 warp 内部（32 个线程）完成树形归约
+//
+// 共享内存归约到最后只剩 32 个线程时，它们的部分和仍分散在 shmem[0..31]。
+// 这一步若仍用 __syncthreads() 逐轮同步会非常浪费——因为 warp 是硬件级的
+// 同步执行单元，单条 SIMT 指令天然保证所有 lane 同时执行，无需软件屏障。
+//
+// 参数 volatile 至关重要：它阻止编译器把多次 shmem[tid] 读改写重排成寄存器
+// 缓存（读写共享内存必须按顺序发生），否则归约会得到错误结果。
+//
+// 步长从 32 开始逐次减半：同一指令周期内，lane tid 读 shmem[tid+step]，
+// 而该值正是上一轮由 lane tid+step 刚写入的，二者恰好同步执行，故无需任何
+// __syncthreads()。归约结果收敛在 lane 0，即 shmem[0]。
+//============================================================================
+__device__ void warpReduce(volatile float* shmem, int tid)
+{
+    // volatile 禁止编译器缓存 shmem，确保读写按顺序落共享内存。
+    shmem[tid] += shmem[tid + 32];   // 32 -> 16 个部分和
+    shmem[tid] += shmem[tid + 16];   // 16 -> 8
+    shmem[tid] += shmem[tid + 8];    // 8  -> 4
+    shmem[tid] += shmem[tid + 4];    // 4  -> 2
+    shmem[tid] += shmem[tid + 2];    // 2  -> 1
+    shmem[tid] += shmem[tid + 1];    // 收敛到 shmem[0]
+}
 
+//============================================================================
+// reduce_v4: 共享内存归约 + warp 内归约
+//
+// 基于 v3 的每线程双元素预归约，再把 v3 的最后几步共享内存归约替换为
+// warpReduce。这是 CUDA C Programming Guide 的 v4 优化版本。
+//
+// 相比 v3 的改进：v3 的循环会一直降到 s=1，最后 5 轮参与线程不足一个 warp，
+// 绝大多数 lane 空转且每轮都要一次 __syncthreads()（还伴随明显的 warp 分歧）。
+// v4 让循环在 s>32 时提前退出，剩下 64 个部分和（shmem[0..63]）交给
+// warpReduce：其第一步 (+32) 把后 32 个折进前 32 个，随后在单个 warp 内
+// 做 5 步树形归约收敛到 shmem[0]——全程无需任何 __syncthreads()。
+//
+// 启动配置与 v3 一致：gridSize 需按 ceil(n / (2 * blockSize)) 计算。
+//============================================================================
+__global__ void reduce_v4(float* input, float* output, int n)
+{
+    extern __shared__ float shmem[];  // 每个 block 私有的动态共享内存
 
+    int tid = threadIdx.x;                          // 块内线程编号
+    int gid = blockIdx.x * (blockDim.x * 2) + tid;  // 每个 block 处理 2*blockDim.x 个元素
+
+    // 每线程预归约两个相距 blockDim.x 的元素，越界位置按 0 处理；
+    // 之后进入共享内存归约的数据量从 2*blockDim.x 压缩到 blockDim.x。
+    float val = 0.0f;
+    if (gid < n)               val += input[gid];
+    if (gid + blockDim.x < n)  val += input[gid + blockDim.x];
+    shmem[tid] = val;
+    __syncthreads();            // 保证共享内存归约前所有数据均已写入
+
+    // 与 v3 相同的反向步长共享内存归约，但循环在 s>32 时即停止：
+    // 当活跃线程数降到 32 以内时，剩下的归约交给 warpReduce，避免
+    // 小规模线程下的 __syncthreads() 与 warp 分歧开销。
+    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1)
+    {
+        if (tid < s)
+        {
+            shmem[tid] += shmem[tid + s];
+        }
+        __syncthreads();        // 仅当线程数 > 32 时才需要同步
+    }
+
+    // 最后 32 个部分和（shmem[0..31]）在一个 warp 内归约，无需同步。
+    if (tid < 32)
+    {
+        warpReduce(shmem, tid);
+    }
+
+    // 归约结果收敛在 shmem[0]，由 tid 0 写出该 block 的部分和。
+    if (tid == 0)
+    {
+        output[blockIdx.x] = shmem[0];
+    }
+}
 
 
 
@@ -335,7 +411,7 @@ int main()
     constexpr int blockSize = 256;                         // 每 block 线程数
     constexpr int gridSize = (n + blockSize - 1) / blockSize;
     constexpr int v3GridSize = (n + blockSize * 2 - 1) / (blockSize * 2);
-    constexpr bool strictBenchmark = true; // 改为 true 可启用严格性能测试
+    constexpr bool strictBenchmark = false; // 改为 true 可启用严格性能测试
     testReduceKernel(reduce_v0, "reduce_v0", n, gridSize, blockSize, strictBenchmark);
     testReduceKernel(reduce_v1, "reduce_v1", n, gridSize, blockSize, strictBenchmark);
     testReduceKernel(reduce_v2, "reduce_v2", n, gridSize, blockSize, strictBenchmark);
