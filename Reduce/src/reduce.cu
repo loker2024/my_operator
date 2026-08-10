@@ -200,26 +200,44 @@ __global__ void reduce_v3(float* input, float* output, int n)
 //============================================================================
 // warpReduce: 在一个 warp 内部（32 个线程）完成树形归约
 //
-// 共享内存归约到最后只剩 32 个线程时，它们的部分和仍分散在 shmem[0..31]。
-// 这一步若仍用 __syncthreads() 逐轮同步会非常浪费——因为 warp 是硬件级的
-// 同步执行单元，单条 SIMT 指令天然保证所有 lane 同时执行，无需软件屏障。
+// block 级共享内存归约停止时还剩 64 个部分和，分散在 shmem[0..63]；
+// 只需让一个 warp 的 32 个线程先执行 +32，就能把它们折叠到 shmem[0..31]，
+// 再继续完成 32 -> 16 -> 8 -> 4 -> 2 -> 1 的树形归约。
 //
 // 参数 volatile 至关重要：它阻止编译器把多次 shmem[tid] 读改写重排成寄存器
 // 缓存（读写共享内存必须按顺序发生），否则归约会得到错误结果。
 //
-// 步长从 32 开始逐次减半：同一指令周期内，lane tid 读 shmem[tid+step]，
-// 而该值正是上一轮由 lane tid+step 刚写入的，二者恰好同步执行，故无需任何
-// __syncthreads()。归约结果收敛在 lane 0，即 shmem[0]。
+// 步长从 32 开始逐次减半。经典隐式同步写法依赖同一 warp 的锁步执行，
+// 每一轮使用上一轮已经写好的值；最终结果收敛在 lane 0，即 shmem[0]。
 //============================================================================
 __device__ void warpReduce(volatile float* shmem, int tid)
 {
-    // volatile 禁止编译器缓存 shmem，确保读写按顺序落共享内存。
-    shmem[tid] += shmem[tid + 32];   // 32 -> 16 个部分和
-    shmem[tid] += shmem[tid + 16];   // 16 -> 8
-    shmem[tid] += shmem[tid + 8];    // 8  -> 4
-    shmem[tid] += shmem[tid + 4];    // 4  -> 2
-    shmem[tid] += shmem[tid + 2];    // 2  -> 1
-    shmem[tid] += shmem[tid + 1];    // 收敛到 shmem[0]
+    // 调用方只让 tid=0..31（一个 warp）进入这里，但开始时待归约的数据有
+    // 64 个，即 shmem[0..63]。第一句由 32 个 lane 把后半区折叠到前半区：
+    //   lane i: B[i] + B[i+32] -> C[i]，得到 C[0..31]。
+    //
+    // 后续每句仍由全部 32 个 lane 实际执行；“有效 lane”才会逐轮减半。
+    // 例如执行 +16 时：
+    //   lane 0 : C[0]  + C[16] -> shmem[0]   （有效）
+    //   lane 16: C[16] + B[32] -> shmem[16]  （无效，不是 C[16]+C[32]）
+    // 在经典 warp 锁步模型中，同一条指令的各 lane 先读取本轮旧值，再写回
+    // 新值。因此 lane 0 读取的是 lane 16 本轮写回前的 C[16]；而 lane 16
+    // 写出的无效结果之后不会再进入 shmem[0] 的依赖链，不会污染最终结果。
+    // 各轮“实际执行 lane / 结果有效 lane”分别为：
+    //   +32: 0..31 / 0..31    +16: 0..31 / 0..15
+    //   +8 : 0..31 / 0..7     +4 : 0..31 / 0..3
+    //   +2 : 0..31 / 0..1     +1 : 0..31 / 0
+    // 最终只有 shmem[0] 会被调用方使用。
+    //
+    // volatile 禁止编译器缓存或重排这些共享内存访问。该写法依赖经典的
+    // 隐式 warp 同步；现代 CUDA 更推荐用 __syncwarp() 明确同步，或改用
+    // __shfl_down_sync() 在寄存器之间完成 warp 规约。
+    shmem[tid] += shmem[tid + 32];   // 64 -> 32 个有效部分和   lane 0..31
+    shmem[tid] += shmem[tid + 16];   // 32 -> 16               lane 0..15
+    shmem[tid] += shmem[tid + 8];    // 16 -> 8                lane 0..7
+    shmem[tid] += shmem[tid + 4];    // 8  -> 4                lane 0..3
+    shmem[tid] += shmem[tid + 2];    // 4  -> 2                lane 0..1
+    shmem[tid] += shmem[tid + 1];    // 2  -> 1，收敛到 shmem[0]lane 0
 }
 
 //============================================================================
@@ -276,6 +294,187 @@ __global__ void reduce_v4(float* input, float* output, int n)
     }
 }
 
+//============================================================================
+// reduce_v5: 用模板参数完全展开共享内存归约
+//
+// v3/v4 的 blockSize 是运行时变量，因此共享内存归约需要循环和步长判断。
+// v5 把 BLOCK_SIZE 变为编译期常量，使编译器可以删除不适用的分支并把各轮
+// 归约直接展开。每个线程仍先读取两个元素，所以一个 block 覆盖
+// 2 * BLOCK_SIZE 个输入元素。
+//
+// 前三轮把共享内存中的有效部分和缩减到 64 个，最后一个 warp 再完成
+// 64 -> 32 -> ... -> 1 的展开式归约。当前实现要求 BLOCK_SIZE 是
+// 64、128、256 或 512；启动时的 blockDim.x 必须与模板参数完全一致。
+//============================================================================
+template <int BLOCK_SIZE>
+__global__ void reduce_v5(float* input, float* output, int n)
+{
+    extern __shared__ float smem[];
+
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * (BLOCK_SIZE * 2) + tid;
+
+    // 在寄存器中先合并两个输入，尾部越界位置按 0 处理。
+    float val = 0.0f;
+    if (gid < n)              val += input[gid];
+    if (gid + BLOCK_SIZE < n) val += input[gid + BLOCK_SIZE];
+    smem[tid] = val;
+    __syncthreads();
+
+    // BLOCK_SIZE 是编译期常量，不满足的 if 会被编译器直接消除。
+    // 每一轮均依赖上一轮产生的部分和，因此轮次之间仍需 block 级同步。
+    if (BLOCK_SIZE >= 512) { if (tid < 256) smem[tid] += smem[tid + 256]; __syncthreads(); }
+    if (BLOCK_SIZE >= 256) { if (tid < 128) smem[tid] += smem[tid + 128]; __syncthreads(); }
+    if (BLOCK_SIZE >= 128) { if (tid <  64) smem[tid] += smem[tid +  64]; __syncthreads(); }
+
+    // 剩余 64 个部分和由第一个 warp 完成；volatile 保证共享内存访问不会
+    // 被编译器缓存或重排。只有 lane 0 的最终结果有效。
+    if (tid < 32)
+    {
+        volatile float* vsmem = smem;
+        if (BLOCK_SIZE >= 64) vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid +  8];
+        vsmem[tid] += vsmem[tid +  4];
+        vsmem[tid] += vsmem[tid +  2];
+        vsmem[tid] += vsmem[tid +  1];
+    }
+
+    if (tid == 0)
+    {
+        output[blockIdx.x] = smem[0];
+    }
+}
+
+//============================================================================
+// warpReduceSum: 使用 shuffle 指令在一个 warp 的寄存器之间求和
+//
+// __shfl_down_sync 直接读取同一 warp 中更高 lane 的寄存器，无需先写共享
+// 内存。offset 依次为 16、8、4、2、1；最终 lane 0 持有整个 warp 的和，
+// 其他 lane 的返回值只是中间结果，调用方不应使用。
+//============================================================================
+__device__ float warpReduceSum(float val)
+{
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+//============================================================================
+// reduce_v6: Warp Shuffle + 两级规约
+//
+// v5 的最后阶段仍通过共享内存交换数据；v6 改用 shuffle 在寄存器间通信：
+//   1. 每个 warp 独立求和，lane 0 把结果写入 warp_results；
+//   2. warp 0 读取这些结果，再执行一次 warp 内求和。
+// 这样共享内存只需保存“每个 warp 一个值”，并且整个 block 只需要一次
+// __syncthreads()。blockDim.x 必须是 32 的倍数且不超过 1024。
+//============================================================================
+__global__ void reduce_v6(float* input, float* output, int n)
+{
+    const int tid  = threadIdx.x;
+    const int gid  = blockIdx.x * (blockDim.x * 2) + tid;
+    const int lane = tid % 32;      // 线程在 warp 内的编号 [0, 31]
+    const int wid  = tid / 32;      // warp 在当前 block 内的编号
+
+    // 与 v3~v5 相同，每个线程先在寄存器中预归约两个输入元素。
+    float val = 0.0f;
+    if (gid < n)              val += input[gid];
+    if (gid + blockDim.x < n) val += input[gid + blockDim.x];
+
+    // 第一级：每个 warp 在寄存器中独立规约。
+    val = warpReduceSum(val);
+
+    // 一个 block 最多有 1024 / 32 = 32 个 warp，故静态数组长度为 32。
+    // 只有各 warp 的 lane 0 写入，槽位 wid 互不冲突。
+    __shared__ float warp_results[32];
+    if (lane == 0)
+    {
+        warp_results[wid] = val;
+    }
+    __syncthreads();                    // 保证 warp 0 读取前所有部分和已写入
+
+    // 第二级：warp 0 的前 num_warps 个 lane 各读取一个 warp 的结果，
+    // 其余 lane 补 0，随后复用相同的 shuffle 规约。
+    const int num_warps = blockDim.x / 32;
+    if (wid == 0)
+    {
+        val = (lane < num_warps) ? warp_results[lane] : 0.0f;
+        val = warpReduceSum(val);
+    }
+
+    if (tid == 0)
+    {
+        output[blockIdx.x] = val;
+    }
+}
+
+//============================================================================
+// reduce_v7: float4 向量化加载 + Grid Stride Loop + Warp Shuffle
+//
+// v6 每线程只读取两个 float；v7 把输入视作 float4，每条向量加载指令读取
+// 四个连续 float，并通过 grid-stride loop 允许固定数量的线程处理任意长度
+// 输入。向量区间之后不足 4 个元素的尾部仍用标量加载，因而 n 无需是 4
+// 的倍数。cudaMalloc 返回的地址满足 float4 所需的 16 字节对齐要求。
+//
+// block 内归约与 v6 相同：先做 warp 内 shuffle，再由 warp 0 汇总各 warp。
+// blockDim.x 必须是 32 的倍数且不超过 1024。
+//============================================================================
+__global__ void reduce_v7(float* input, float* output, int n)
+{
+    const int tid  = threadIdx.x;
+    const int lane = tid % 32;
+    const int wid  = tid / 32;
+
+    // n4 表示可安全按 float4 访问的完整向量数量。
+    const float4* input4 = reinterpret_cast<const float4*>(input);
+    const int n4 = n / 4;
+
+    float val = 0.0f;
+
+    // 所有 block 的线程组成一个逻辑网格；每轮跨过整个网格，保证每个
+    // float4 恰好由一个线程处理，同时保持相邻线程访问相邻地址。
+    for (int idx = blockIdx.x * blockDim.x + tid;
+         idx < n4;
+         idx += gridDim.x * blockDim.x)
+    {
+        float4 data = input4[idx];
+        val += data.x + data.y + data.z + data.w;
+    }
+
+    // 标量处理最后 n % 4 个元素；沿用相同的 grid-stride 分工，避免重复。
+    const int tail_start = n4 * 4;
+    for (int idx = tail_start + blockIdx.x * blockDim.x + tid;
+         idx < n;
+         idx += gridDim.x * blockDim.x)
+    {
+        val += input[idx];
+    }
+
+    // 第一级：各 warp 独立归约线程局部和。
+    val = warpReduceSum(val);
+
+    __shared__ float warp_results[32];
+    if (lane == 0)
+    {
+        warp_results[wid] = val;
+    }
+    __syncthreads();
+
+    // 第二级：warp 0 汇总所有 warp 的部分和。
+    const int num_warps = blockDim.x / 32;
+    if (wid == 0)
+    {
+        val = (lane < num_warps) ? warp_results[lane] : 0.0f;
+        val = warpReduceSum(val);
+    }
+
+    if (tid == 0)
+    {
+        output[blockIdx.x] = val;
+    }
+}
 
 
 // 归约内核的统一签名。传入此类型即可被 testReduceKernel 复用。
@@ -407,14 +606,28 @@ void testReduceKernel(ReduceKernel kernel, const char* kernelName,
 
 int main()
 {
-    constexpr int n = 1 << 20;                            // 测试数据量 1048576
-    constexpr int blockSize = 256;                         // 每 block 线程数
-    constexpr int gridSize = (n + blockSize - 1) / blockSize;
-    constexpr int v3GridSize = (n + blockSize * 2 - 1) / (blockSize * 2);
+    constexpr int n = 1 << 20;             // 测试数据量：1,048,576 个 float
+    constexpr int blockSize = 256;         // 每个 block 使用 256 个线程（8 个 warp）
     constexpr bool strictBenchmark = false; // 改为 true 可启用严格性能测试
-    testReduceKernel(reduce_v0, "reduce_v0", n, gridSize, blockSize, strictBenchmark);
-    testReduceKernel(reduce_v1, "reduce_v1", n, gridSize, blockSize, strictBenchmark);
-    testReduceKernel(reduce_v2, "reduce_v2", n, gridSize, blockSize, strictBenchmark);
-    testReduceKernel(reduce_v3, "reduce_v3", n, v3GridSize, blockSize, strictBenchmark);
+
+    // v0~v2 每线程读取一个元素；v3~v6 每线程读取两个元素；v7 每次向量化
+    // 读取四个元素。分别计算网格大小，避免启动不会处理数据的多余 block。
+    constexpr int oneElementGrid = (n + blockSize - 1) / blockSize;
+    constexpr int twoElementGrid =
+        (n + blockSize * 2 - 1) / (blockSize * 2);
+    constexpr int fourElementGrid =
+        (n + blockSize * 4 - 1) / (blockSize * 4);
+
+    // 依次运行所有版本。统一测试函数会完成预热、计时、CPU 参考值校验，
+    // 因此输出既能检查每次优化后的正确性，也便于横向比较执行时间。
+    testReduceKernel(reduce_v0, "reduce_v0", n, oneElementGrid, blockSize, strictBenchmark);
+    testReduceKernel(reduce_v1, "reduce_v1", n, oneElementGrid, blockSize, strictBenchmark);
+    testReduceKernel(reduce_v2, "reduce_v2", n, oneElementGrid, blockSize, strictBenchmark);
+    testReduceKernel(reduce_v3, "reduce_v3", n, twoElementGrid, blockSize, strictBenchmark);
+    testReduceKernel(reduce_v4, "reduce_v4", n, twoElementGrid, blockSize, strictBenchmark);
+    testReduceKernel(reduce_v5<blockSize>, "reduce_v5", n, twoElementGrid,
+                     blockSize, strictBenchmark);
+    testReduceKernel(reduce_v6, "reduce_v6", n, twoElementGrid, blockSize, strictBenchmark);
+    testReduceKernel(reduce_v7, "reduce_v7", n, fourElementGrid, blockSize, strictBenchmark);
     return 0;
 }
