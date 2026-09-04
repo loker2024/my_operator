@@ -1,0 +1,9 @@
+# 适用于 CUDA C++（.cu/.cuh/.h/.cpp）的统一样式
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 100
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: Inline
+BreakBeforeBraces: Attach
+Standard: c++17

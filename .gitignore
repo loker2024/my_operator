@@ -1,14 +1,38 @@
-# Xmake cache
-.xmake/
+# 构建产物
 build/
-/build-*/
-/cmake-build-*/
+build-*/
+cmake-build-*/
+CMakeUserPresets.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.exe
+*.out
+compile_commands.json
 
-# Local IDE state and machine-specific toolchain paths
-/.idea/
-/.vscode/
+# 运行产生的数据文件
+*.bin
+*.raw
+*.log
+*.tmp
 
-# MacOS Cache
+# 本地 Python 环境（第二阶段 Triton）
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.eggs/
+*.egg-info/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+.vs/
+*.suo
+*.user
 .DS_Store
 
-
+# 系统与杂项
+core

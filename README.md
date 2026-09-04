@@ -1,59 +1,109 @@
 # my_operator
 
-CUDA 并行算子学习项目。目前包含共享内存归约（Reduction）的多个逐步优化版本，用于对比线程访问方式、同步开销和每线程处理元素数对性能的影响。
+面向 **CUDA 基础算子** 的学习与实验仓库。目标算子：Softmax、GEMM、Attention、Reduce（后续按需扩展）。
 
-## 内容
+实现路线：
 
-| 目录 / 目标 | 说明 |
-| --- | --- |
-| `Reduce` / `Reduce.exe` | CUDA 浮点求和归约的正确性验证与性能测试。 |
-| `Sgemm` / `Sgemm.exe` | SGEMM 实验入口（当前为基础占位程序）。 |
+1. **第一阶段：CUDA 核心版本**。先用 CUDA 写出正确、可运行的内核，逐个做优化变体，并建立统一的正确性验证与性能基准口径。
+2. **第二阶段：Triton 版本**。为同一算子用 Triton 实现，与 CUDA 版本做正确性对齐和性能对照。
 
-`Reduce/src/reduce.cu` 提供了以下内核：
+各算子的详细状态、内核版本规划以其目录内 `README.md` 为准。
 
-| 内核 | 策略 |
-| --- | --- |
-| `reduce_v0` | 交错寻址归约，用作基础对照。 |
-| `reduce_v1` | 连续活跃线程的树形归约。 |
-| `reduce_v2` | 从大步长到小步长的顺序寻址归约。 |
-| `reduce_v3` | 每线程先在寄存器中累加两个元素，再执行 v2 风格的共享内存归约。 |
+## 算子与实现状态
 
-所有版本先在 GPU 上产生每个 block 的部分和，最终总和由主机端累加并与 CPU 参考值比较。
+| 算子 | 说明 | CUDA 核心版 | Triton 版 | 目录 |
+| --- | --- | --- | --- | --- |
+| Softmax | fp32，行主序、逐行归一化 | 规划中 | 规划中 | `operators/softmax` |
+| GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 规划中 | 规划中 | `operators/gemm` |
+| Attention | 单头、fp32、无 mask | 规划中 | 规划中 | `operators/attention` |
+| Reduce | fp32 行求和，`out[i]=Σ_j x[i,j]`，可扩展列/全归约 | 规划中 | 规划中 | `operators/reduce` |
+
+状态说明：
+
+- `规划中`：骨架与规划已建立，内核尚未实现。
+- `进行中`：CUDA/Triton 核心版本已可运行，处于优化阶段。
+- `完成`：核心版本通过正确性验证，并记录了基准结果。
+
+## 目录结构
+
+```
+my_operator/
+├── common/                     # 各算子共享的宿主工具（头文件库）
+│   └── include/operator_common/
+│       ├── cuda_check.h        # CUDA 错误检查 / 设备信息
+│       ├── CpuTimer.h          # CPU 计时（std::chrono）
+│       └── GpuTimer.h          # CUDA 事件计时
+├── operators/
+│   ├── softmax/                # Softmax：CUDA → Triton
+│   │   ├── README.md           # 规划与结论
+│   │   ├── CMakeLists.txt      # 出现 src/main.cu 后自动启用（三个算子同构）
+│   │   └── src/                # CUDA 源码（由你实现），src/main.cu 为入口
+│   ├── gemm/                   # SGEMM：CUDA → Triton（结构同 softmax）
+│   ├── attention/              # Attention：CUDA → Triton（结构同 softmax）
+│   └── reduce/                 # Reduce：CUDA → Triton（结构同 softmax）
+├── docs/
+│   └── benchmark-methodology.md # 正确性验证与性能基准的统一口径
+├── CMakeLists.txt
+├── CMakePresets.json           # 一条命令完成 Release/Debug 配置
+├── CHANGELOG.md
+└── README.md
+```
+
+单个算子的推荐目录布局（按实现进度逐步生成）：
+
+```
+operators/<name>/
+├── README.md      # 算子说明、内核版本规划、状态与结论
+├── src/           # 第一阶段：CUDA 内核与宿主入口（main.cu）
+├── triton/        # 第二阶段：Triton 实现（Python）
+└── notes/         # 学习笔记、优化记录（可选，也可统一放 docs/）
+```
 
 ## 环境要求
 
-- 支持 CUDA 的 NVIDIA GPU 与 CUDA Toolkit
-- CMake 3.24 或更高版本
-- 支持 C++17 的编译器；Windows 下建议使用 MSVC x64 开发者命令行
+- NVIDIA GPU + CUDA Toolkit（开发机为 RTX 4060 Laptop，Ada 架构 sm_89，CUDA 12.9）
+- CMake ≥ 3.24
+- Ninja（推荐）与支持 C++17 的编译器（gcc / clang / MSVC）
 
 ## 构建与运行
 
-在 Windows 的 **x64 Native Tools Command Prompt for VS** 或 **Developer PowerShell for VS** 中执行：
+每个算子目录都自带 `CMakeLists.txt` 且已被顶层注册，但**只有目录里出现 `src/main.cu` 才会真正启用**（否则 configure 时自动跳过，不影响其他算子）。实现一个算子的流程：
 
-```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target Reduce
-.\build\Reduce.exe
+```bash
+# 1. 创建源码，例如 operators/softmax/src/main.cu（及其它 .cu/.cuh）
+# 2. 重新 configure（新增/删除文件后必须重新执行）
+cmake --preset release
+# 3. 构建并运行
+cmake --build build --target softmax   # 目标名 = 算子目录名
+./build/operators/softmax/softmax
 ```
 
-若未使用 Ninja，可省略 `-G Ninja`，由 CMake 选择本机可用生成器。
+运行该可执行文件即执行该算子的「正确性验证 + 性能基准」，打印通过/失败与耗时统计（失败时返回非零退出码，便于脚本化）。
 
-## 归约测试配置
+其他 GPU 上构建时，用 `native` 覆盖默认架构即可：
 
-`main` 中可调整以下参数：
-
-```cpp
-constexpr int n = 1 << 20;
-constexpr int blockSize = 256;
-constexpr bool strictBenchmark = true;
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native
 ```
 
-- `strictBenchmark = false`：1 次预热、100 次内核迭代，适合快速验证。
-- `strictBenchmark = true`：1000 次预热、21 组 × 10000 次迭代，输出中位数及 P5/P95 时间范围，适合稳定地比较版本性能。
-- `v0`~`v2` 使用 `ceil(n / blockSize)` 个 block；`v3` 因每线程处理两个元素，使用 `ceil(n / (2 * blockSize))` 个 block。
+## 质量与基准口径
 
-归约循环假定 `blockSize` 为 2 的幂。性能输出中的带宽是按输入读取和部分和写回计算的**有效带宽**，并非显存物理带宽。
+正确性验证与性能计时遵循统一口径，详见 `docs/benchmark-methodology.md`。核心约定：
+
+- **先验证正确性，再计时**；fp32 默认容差按算子类型分别声明。
+- 性能统计使用多次迭代的**中位数**，并给出 P5/P95 区间；带宽类算子报告**有效带宽**。
+- 所有数值规模、块大小、预热/迭代次数在算子入口处集中配置，便于复现。
+
+## 路线图
+
+- [ ] 仓库骨架与文档（本阶段）
+- [ ] Softmax：CUDA 核心版本（v0 → 优化变体）
+- [ ] GEMM：CUDA 核心版本（v0 → 优化变体）
+- [ ] Attention：CUDA 核心版本（v0 → Flash 风格）
+- [ ] Reduce：CUDA 核心版本（v0 → 优化变体）
+- [ ] 各算子正确性验证与基准记录
+- [ ] 逐个补充 Triton 版本，与 CUDA 对齐并对照性能
 
 ## 许可证
 
-当前仓库尚未声明许可证；如需复用或发布，请先补充合适的 LICENSE 文件。
+[MIT](LICENSE)
