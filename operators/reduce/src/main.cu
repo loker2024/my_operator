@@ -4,12 +4,18 @@
 // 职责
 //   本文件只做“执行”：把被测归约内核（reduce_v0 / reduce_v1，未来 v2…）
 //   注册给可复用测试驱动 test_reduce_kernel（声明见 test.cuh，实现见
-//   test.cu），逐一覆盖 正常流程 / 边界条件 / 异常与健壮性 三类场景，
+//   test.cu），按开关覆盖 正常流程 / 边界条件 / 异常与健壮性 三类场景，
 //   并以退出码汇总结果（0 = 全部通过，供脚本化使用）。
 //
 // 新增内核版本的接入方式（可复用测试的关键）：
 //   只需在下方 kernels 表追加一项 { 名字, 内核指针 }，即可自动对所有
 //   场景复用同一套测试代码；无需改动测试驱动 test.cu 或场景表。
+//
+// 两个开关（均为函数参数，默认关闭；见 RunScenarios 的注释）：
+//   enable_boundary   是否执行边界条件与异常/健壮性场景；
+//   strict_benchmark  是否按严格口径采样性能（与 test_reduce_kernel 同名参数一致）。
+//   默认状态下只跑“正常流程 + 快速性能口径”，日常开发迭代最快；需要全量
+//   回归或出严格基准数字时，把 main() 中的开关改为 true 即可。
 //
 // 场景设计（各类别的意图与覆盖点，详见各场景组的注释）：
 //   A. 正常流程 —— 常规大规模形状，验证基本正确性与性能；
@@ -32,7 +38,8 @@
 //   main.cu                  执行入口（本文件）
 // ============================================================================
 
-#include <cstdio>  // printf / std::snprintf
+#include <cstddef>  // std::size_t
+#include <cstdio>   // printf / std::snprintf
 
 #include "reduce.cuh"  // ReduceKernel 统一签名、reduce_v0 / reduce_v1 声明
 #include "test.cuh"    // test_reduce_kernel 声明（内部经 reduce.cuh 引入算子接口）
@@ -74,6 +81,12 @@ struct Scenario {
   int extra_grid;
 };
 
+// 编译期取场景表长度（配合下方基于数组的场景表，避免手写个数）。
+template <size_t N>
+constexpr size_t CountOf(const Scenario (&)[N]) {
+  return N;
+}
+
 // 由场景参数计算实际启动的 grid 大小：
 //   base = ceil(n / block)；n == 0 时也必须至少 1（空 block 全走补 0 分支，
 //   结果恒为 0，可安全启动）；最后叠加 extra_grid 个冗余 block。
@@ -105,12 +118,71 @@ const Scenario kAbnormalScenarios[] = {
     {"健壮: n=2^18, grid 超配 +3 个冗余 block", 1 << 18, 3},
 };
 
+// ---------------------------------------------------------------------------
+// 场景执行
+// ---------------------------------------------------------------------------
+// 对单个内核跑一遍场景，返回 true 表示该内核全部 PASS。
+//
+// 开关（均为函数参数，默认关闭）：
+//   enable_boundary   true  时执行 B 组（边界条件）与 C 组（异常/健壮性）；
+//                     false（默认）时只跑 A 组正常流程，并在报告中标注跳过，
+//                     避免日常迭代被大量极小形状（无性能意义的用例）拖慢。
+//   strict_benchmark  true  时按严格口径采样（1000 预热 + 21 组 × 10000 次，
+//                     输出中位数与 P5/P95）；false（默认）时快速模式（1 预热
+//                     + 100 次）。该开关透传给 test_reduce_kernel 的同名参数，
+//                     两处口径保持一致。
+//
+// passed / total 可选：非空时累加本次执行的 PASS 数与用例总数，便于 main 汇总。
+bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
+                  bool strict_benchmark = false, int* passed = nullptr,
+                  int* total = nullptr) {
+  bool all_ok = true;
+  int local_passed = 0;
+  int local_total = 0;
+
+  const auto run_group = [&](const char* title, const Scenario* scenarios, size_t count) {
+    std::printf("== %s ==\n", title);
+    for (size_t i = 0; i < count; ++i) {
+      const Scenario& s = scenarios[i];
+      char full_name[192];
+      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
+      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
+                                         GridFor(s.n, kBlock, s.extra_grid), kBlock,
+                                         strict_benchmark);
+      all_ok = ok && all_ok;
+      local_passed += ok ? 1 : 0;
+      local_total += 1;
+    }
+  };
+
+  run_group("[A] 正常流程", kNormalScenarios, CountOf(kNormalScenarios));
+  if (enable_boundary) {
+    run_group("[B] 边界条件", kBoundaryScenarios, CountOf(kBoundaryScenarios));
+    run_group("[C] 异常与健壮性", kAbnormalScenarios, CountOf(kAbnormalScenarios));
+  } else {
+    std::printf("== [B] 边界条件 / [C] 异常与健壮性 ==\n");
+    std::printf("    已跳过（enable_boundary = false，默认关闭）\n");
+  }
+
+  if (passed != nullptr) *passed += local_passed;
+  if (total != nullptr) *total += local_total;
+  return all_ok;
+}
+
 }  // namespace
 
 int main() {
+  // 开关集中在此处，默认均关闭：只跑正常流程 + 快速性能口径。
+  // 需要全量回归（含边界条件 / 异常与健壮性）或严格基准数字时，改为 true。
+  constexpr bool kEnableBoundary = false;
+  constexpr bool kStrictBenchmark = false;
+
   std::printf("==== Reduce 测试：正确性(容差 1e-3) + 性能 ====\n");
-  std::printf("block = %d；被测内核 %zu 个，各跑 3 组场景（正常/边界/异常）\n\n",
-              kBlock, sizeof(kKernels) / sizeof(kKernels[0]));
+  std::printf("block = %d；被测内核 %zu 个\n", kBlock,
+              sizeof(kKernels) / sizeof(kKernels[0]));
+  std::printf("开关: enable_boundary = %s, strict_benchmark = %s\n\n",
+              kEnableBoundary ? "true" : "false",
+              kStrictBenchmark ? "true" : "false");
 
   bool all_ok = true;
   int passed = 0;
@@ -118,43 +190,8 @@ int main() {
 
   for (const KernelEntry& kern : kKernels) {
     std::printf("---------------- %s ----------------\n", kern.name);
-
-    // 场景组 A：正常流程。
-    std::printf("== [A] 正常流程 ==\n");
-    for (const Scenario& s : kNormalScenarios) {
-      char full_name[192];
-      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
-      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
-                                         GridFor(s.n, kBlock, s.extra_grid), kBlock);
-      all_ok = ok && all_ok;
-      passed += ok ? 1 : 0;
-      total += 1;
-    }
-
-    // 场景组 B：边界条件。
-    std::printf("== [B] 边界条件 ==\n");
-    for (const Scenario& s : kBoundaryScenarios) {
-      char full_name[192];
-      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
-      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
-                                         GridFor(s.n, kBlock, s.extra_grid), kBlock);
-      all_ok = ok && all_ok;
-      passed += ok ? 1 : 0;
-      total += 1;
-    }
-
-    // 场景组 C：异常 / 健壮性。
-    std::printf("== [C] 异常与健壮性 ==\n");
-    for (const Scenario& s : kAbnormalScenarios) {
-      char full_name[192];
-      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
-      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
-                                         GridFor(s.n, kBlock, s.extra_grid), kBlock);
-      all_ok = ok && all_ok;
-      passed += ok ? 1 : 0;
-      total += 1;
-    }
-
+    const bool ok = RunScenarios(kern, kEnableBoundary, kStrictBenchmark, &passed, &total);
+    all_ok = ok && all_ok;
     std::printf("\n");
   }
 

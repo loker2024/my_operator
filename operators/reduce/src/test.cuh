@@ -43,6 +43,7 @@
 //
 // 覆盖说明：测试数据 (i % 1000) 确定性可复现且全非负；结合 main.cu 传入的
 // 不同形状（对齐 / 非对齐 / 单元素 / 恰好一个 block / 空输入 / 冗余 grid），
-// 可覆盖正常流程、边界条件与异常启动三类场景。
+// 可覆盖正常流程、边界条件与异常启动三类场景。其中边界条件与异常形状由
+// main.cu 的 enable_boundary 开关控制，默认关闭（默认只跑正常流程）。
 bool test_reduce_kernel(ReduceKernel kernel, const char* kernel_name, int n,
                         int grid, int block, bool strict_benchmark = false);

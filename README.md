@@ -100,7 +100,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
 - [ ] Softmax：CUDA 核心版本（v0 → 优化变体）
 - [ ] GEMM：CUDA 核心版本（v0 → 优化变体）
 - [ ] Attention：CUDA 核心版本（v0 → Flash 风格）
-- [x] Reduce：CUDA 核心版本（v0 → 优化变体）   <!-- v0 交错寻址基线 + v1 连续寻址，18 项测试通过 -->
+- [x] Reduce：CUDA 核心版本（v0 → 优化变体）   <!-- v0 交错寻址基线 + v1 连续寻址；全量 18 项测试通过（默认只跑正常流程 4 项，边界 / 异常场景由开关控制） -->
 - [ ] 各算子正确性验证与基准记录
 - [ ] 逐个补充 Triton 版本，与 CUDA 对齐并对照性能
 
