@@ -6,9 +6,10 @@
 //   * reduce_cpu ：主机端参考实现（正确性基线）
 //   * reduce_v0  ：GPU 归约内核 v0（交错寻址共享内存归约，每 block 一个部分和）
 //   * reduce_v1  ：GPU 归约内核 v1（连续寻址共享内存归约，每 block 一个部分和）
+//   * reduce_v2  ：GPU 归约内核 v2（折半步长共享内存归约，每 block 一个部分和）
 //
-// v0 与 v1 的网格/块模型与启动约束完全相同（同一份测试驱动可直接复用），
-// 区别仅在于块内树形归约的“活跃线程寻址方式”，详见各函数前的注释。
+// v0/v1/v2 的网格/块模型与启动约束完全相同（同一份测试驱动可直接复用），
+// 区别仅在于块内树形归约的“活跃线程寻址方式 / 步长方向”，详见各函数前的注释。
 //
 // 本文件不包含 main()，也不包含测试代码。算子测试按职责拆分：
 //   test.cuh / test.cu  可复用测试驱动（声明 + 实现）
@@ -156,6 +157,85 @@ __global__ void reduce_v1(const float* input, float* output, int n) {
   }
 
   // --- 阶段 3：写回部分和（与 v0 相同） ----------------------------------
+  // tid 0 把收敛在 smem[0] 的块内和写入 output[blockIdx.x]；
+  // 最终标量由调用方对 output[0, grid) 再做一次轻量求和得到。
+  if (tid == 0) {
+    output[blockIdx.x] = smem[0];
+  }
+}
+
+// ============================================================================
+// reduce_v2 —— GPU 归约内核（折半步长，stride halving）
+// ============================================================================
+// 与 v0/v1 的差异：块内树形归约的“步长方向”从“step 从 1 倍增逼近 blockDim.x”
+// 反转为“stride 从 blockDim.x/2 逐轮折半到 1”。部分和每轮就地落回“最靠前的
+// stride 个连续槽”，因此：
+//   * 活跃线程仍是连续前缀 tid < stride（与 v1 一样消除 warp 内分歧）；
+//   * 读写 smem 的下标在活跃前缀内是**连续地址**，天然无共享内存 bank 冲突
+//     （v1 的 index = tid*2*step 使同一 warp 内地址按 2*step 间隔排布，
+//     在大多数轮次会命中 2 路及以上的 bank 冲突）。
+// 网格划分、补 0、动态共享内存、输出约定与启动约束均同 v0/v1。
+//
+// 逻辑说明（以 blockDim.x = 8 为例）：
+//   smem 初始： [a0 a1 a2 a3 a4 a5 a6 a7]   （每个槽为对应输入元素）
+//   第 1 轮 (stride=4)：活跃 tid ∈ [0,4)
+//     tid0: smem[0]+=smem[4] → a0+a4      tid1: smem[1]+=smem[5] → a1+a5
+//     tid2: smem[2]+=smem[6] → a2+a6      tid3: smem[3]+=smem[7] → a3+a7
+//     结果：前 4 个槽保存两两相隔 4 个元素的局部和
+//   第 2 轮 (stride=2)：活跃 tid ∈ [0,2)
+//     tid0: smem[0]+=smem[2] → Σa0..a3    tid1: smem[1]+=smem[3] → Σa4..a7
+//   第 3 轮 (stride=1)：仅 tid0
+//     tid0: smem[0]+=smem[1] → Σa0..a7（收敛）
+//   每轮都把上一轮保存在 [0, stride) 的局部和两两配对合并，结果继续留在
+//   [0, stride/2)，stride 折半 log2(blockDim.x) 轮后收敛到 smem[0]。
+//
+// 与 v1 的对照（blockDim.x = 256）：
+//   v1 连续寻址：step 从 1 倍增，第 1 轮 index = tid*2，同一 warp 内线程访问
+//     的地址相差 2 个 float，跨 64 个连续槽 → 每轮存在 2 路 bank 冲突，且随
+//     step 增大冲突路数上升；
+//   v2 折半步长：每轮线程 tid 读 smem[tid] 与 smem[tid+stride]（均为连续段），
+//     同一 warp 内地址彼此相邻 → 全程无 bank 冲突，是 v1 之外另一种“代价最小”
+//     的改进：不减少计算量，只改善共享内存访问形态。
+//   注意：v2 不做每线程多元素 / float4 向量化，那是 v0/v1/v2 之后规划中的
+//   “寄存器多元素 + 向量加载”方向（见 reduce.cuh 的版本规划）。
+//
+// 参数、返回值与启动约束与 v1 完全一致，见 reduce_v1 定义处注释：
+//   * grid >= ceil(n / block)（多余 block 全部补 0、部分和为 0，超配安全）；
+//   * block 应为 2 的幂（默认 256）：折半归约需要每轮区间恰好一分为二，
+//     非 2 的幂会在中间轮次出现无法配对/下标重叠；
+//   * 动态共享内存 = block * sizeof(float) 字节。
+// ============================================================================
+__global__ void reduce_v2(const float* input, float* output, int n) {
+  // 动态共享内存：每个 block 的私有副本，大小由启动配置第三参数指定。
+  extern __shared__ float smem[];
+
+  const int tid = threadIdx.x;                            // 块内线程编号
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;  // 全局元素下标
+
+  // --- 阶段 1：数据加载（与 v0/v1 相同） ------------------------------------
+  // 每个线程搬 1 个元素到 smem[tid]；越界（gid >= n）补 0，既保证求和
+  // 结果不变，也保证后续各轮归约读写不越界、不读未初始化数据。
+  smem[tid] = (gid < n) ? input[gid] : 0.0f;
+  // 等待全部槽位就绪后才能开始归约。
+  __syncthreads();
+
+  // --- 阶段 2：树形归约（折半步长） ----------------------------------------
+  // 与 v1 相反：stride 从 blockDim.x/2 出发每轮折半（>>= 1）直至 1。线程
+  // tid 负责把槽位
+  //   tid     （保存前半个区间的局部和）
+  //   tid+stride（后半个区间）
+  // 合并回 smem[tid]。活跃条件 tid < stride 即“连续前缀”，合并结果恰好留在
+  // 数组最前端的 stride 个槽，供下一轮继续配对，因此每轮读写的都是连续地址。
+  // 每轮之间必须 __syncthreads：下一轮要读本轮刚写入的局部和，不同步会读到
+  // 旧值。
+  for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (static_cast<size_t>(tid) < stride) {
+      smem[tid] += smem[tid + static_cast<int>(stride)];
+    }
+    __syncthreads();
+  }
+
+  // --- 阶段 3：写回部分和（与 v0/v1 相同） ----------------------------------
   // tid 0 把收敛在 smem[0] 的块内和写入 output[blockIdx.x]；
   // 最终标量由调用方对 output[0, grid) 再做一次轻量求和得到。
   if (tid == 0) {

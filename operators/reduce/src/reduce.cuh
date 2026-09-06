@@ -21,8 +21,11 @@
 //   v0 交错寻址共享内存归约（interleaved addressing）——正确性基线。
 //   v1 连续寻址共享内存归约（consecutive addressing）——把 v0 每轮的
 //      活跃线程从“交错间隔”改为“连续前缀”，消除 warp 内分歧。
-//   后续版本（v2 每线程多元素 + float4 向量化、v3 反向步长等）将保持与
-//   v0/v1 完全一致的 ReduceKernel 签名与启动模型，从而可被 test.cuh /
+//   v2 折半步长共享内存归约（stride halving）——步长方向与 v1 相反：从
+//      blockDim.x/2 每轮折半到 1，部分和就地落回数组最前端连续槽，读写
+//      均为连续地址，消除 v1 的共享内存 bank 冲突。
+//   后续规划版本（每线程多元素 + float4 向量化、warp shuffle 等）将保持与
+//   v0/v1/v2 完全一致的 ReduceKernel 签名与启动模型，从而可被 test.cuh /
 //   test.cu 中的同一套测试驱动直接复用（只需在 main.cu 更换内核名）。
 //
 // 正确性口径见 docs/benchmark-methodology.md：Reduce 相对误差容差 1e-3。
@@ -63,6 +66,20 @@ __global__ void reduce_v0(const float* input, float* output, int n);
 //          warp 内无分歧。
 // 详细推导、示例与注意事项见 reduce.cu 中本内核的定义处注释。
 __global__ void reduce_v1(const float* input, float* output, int n);
+
+// ---------------------------------------------------------------------------
+// GPU 归约内核 v2（折半步长共享内存归约）
+// ---------------------------------------------------------------------------
+// 网格/块模型、输出约定与启动约束和 v0/v1 完全一致（每 block 一段连续元素 →
+// 1 个部分和写入 output[blockIdx.x]），差异只在块内树形归约的步长方向：
+//   * v1：step 自 1 倍增逼近 blockDim.x，合并写回偶数下标槽 smem[index]，
+//         index = tid*2*step，活跃线程为连续前缀，但同一 warp 内地址间隔
+//         2*step 个 float，多数轮次存在共享内存 bank 冲突；
+//   * v2：stride 自 blockDim.x/2 折半到 1，线程 tid 合并 smem[tid] 与
+//         smem[tid+stride] 后写回 smem[tid]，活跃线程 tid < stride 同样构成
+//         连续前缀，且读写下标在活跃段内连续 → 无 bank 冲突。
+// 详细推导、示例与注意事项见 reduce.cu 中本内核的定义处注释。
+__global__ void reduce_v2(const float* input, float* output, int n);
 
 // ---------------------------------------------------------------------------
 // 归约内核的统一签名

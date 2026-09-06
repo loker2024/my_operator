@@ -2,7 +2,7 @@
 // main.cu —— 一维归约算子的执行入口：注册被测内核并运行测试（正确性 + 性能）
 //
 // 职责
-//   本文件只做“执行”：把被测归约内核（reduce_v0 / reduce_v1，未来 v2…）
+//   本文件只做“执行”：把被测归约内核（reduce_v0 / reduce_v1 / reduce_v2…）
 //   注册给可复用测试驱动 test_reduce_kernel（声明见 test.cuh，实现见
 //   test.cu），按开关覆盖 正常流程 / 边界条件 / 异常与健壮性 三类场景，
 //   并以退出码汇总结果（0 = 全部通过，供脚本化使用）。
@@ -41,7 +41,7 @@
 #include <cstddef>  // std::size_t
 #include <cstdio>   // printf / std::snprintf
 
-#include "reduce.cuh"  // ReduceKernel 统一签名、reduce_v0 / reduce_v1 声明
+#include "reduce.cuh"  // ReduceKernel 统一签名、reduce_v0 / reduce_v1 / reduce_v2 声明
 #include "test.cuh"    // test_reduce_kernel 声明（内部经 reduce.cuh 引入算子接口）
 
 namespace {
@@ -66,6 +66,7 @@ struct KernelEntry {
 const KernelEntry kKernels[] = {
     {"reduce_v0 (交错寻址)", reduce_v0},
     {"reduce_v1 (连续寻址)", reduce_v1},
+    {"reduce_v2 (折半步长)", reduce_v2},
 };
 
 // ---------------------------------------------------------------------------
