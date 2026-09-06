@@ -1,15 +1,20 @@
 // ============================================================================
 // reduce.cu —— 一维归约（求和）算子的实现
 //
-// 与 reduce.cuh 配对：本文件包含该头文件中全部函数的定义。
+// 与 reduce.cuh 配对：本文件包含该头文件中声明的全部实现（reduce_cpu、
+// reduce_v0/v1/v2/v3）。
 // 当前包含：
 //   * reduce_cpu ：主机端参考实现（正确性基线）
 //   * reduce_v0  ：GPU 归约内核 v0（交错寻址共享内存归约，每 block 一个部分和）
 //   * reduce_v1  ：GPU 归约内核 v1（连续寻址共享内存归约，每 block 一个部分和）
 //   * reduce_v2  ：GPU 归约内核 v2（折半步长共享内存归约，每 block 一个部分和）
+//   * reduce_v3  ：GPU 归约内核 v3（每线程 2 元素展开，见函数前注释）
 //
 // v0/v1/v2 的网格/块模型与启动约束完全相同（同一份测试驱动可直接复用），
 // 区别仅在于块内树形归约的“活跃线程寻址方式 / 步长方向”，详见各函数前的注释。
+// v3 演示“每线程多元素展开”：每 block 处理 2 * blockDim.x 个连续元素、每个
+// 线程先预加和 2 个元素再做折半归约。签名与 v0/v1/v2 一致（可共用同一测试
+// 驱动），但“覆盖 n 所需的 block 数”为其一半，grid 口径见 reduce.cuh / main.cu。
 //
 // 本文件不包含 main()，也不包含测试代码。算子测试按职责拆分：
 //   test.cuh / test.cu  可复用测试驱动（声明 + 实现）
@@ -246,6 +251,103 @@ __global__ void reduce_v2(const float* input, float* output, int n) {
   }
 
   // --- 阶段 3：写回部分和（与 v0/v1 相同） ----------------------------------
+  // tid 0 把收敛在 smem[0] 的块内和写入 output[blockIdx.x]；
+  // 最终标量由调用方对 output[0, grid) 再做一次轻量求和得到。
+  if (tid == 0) {
+    output[blockIdx.x] = smem[0];
+  }
+}
+
+// ============================================================================
+// reduce_v3 —— GPU 归约内核（每线程多元素展开：每线程 2 个元素）
+// ============================================================================
+// 本函数落地 README / reduce.cuh 中“每线程多元素展开”的算法层方向（原属
+// 规划，本轮实现并接入）：每 block 处理 2 * blockDim.x 个连续元素，块内每个
+// 线程先各自累加 2 个相距 blockDim.x 的元素，再走 v2 的折半步长树形归约。
+//
+// 与 v0/v1/v2 的差异（集中在“分段模型”，务必注意）：
+//   1) 分段粒度：v0/v1/v2 每 block 负责一段宽 blockDim.x 的连续元素，每线程
+//      搬运 1 个；v3 每 block 负责一段宽 2 * blockDim.x 的连续元素，每线程
+//      贡献 2 个。因此输入长度 n 固定时所需 block 数减半（grid 应取
+//      ceil(n / (2 * blockDim.x))，而非 v0/v1/v2 的 ceil(n / blockDim.x)），
+//      部分和数组 output 的长度也随之减半。
+//   2) 加载方式：每个线程读全局内存 2 次——“段内前半”元素 gid 与“段内
+//      后半”元素 gid + blockDim.x。两次加载各自在 warp 内都保持连续，不改
+//      变合并访存形态；且两次读取互不依赖，可同时挂起两个访存请求，以提升
+//      内存级并行（这正是该方向压缩访存等待时间的原理）。
+//   3) 接口一致性：签名已与 v0/v1/v2 统一为 ReduceKernel（input 用 const
+//      限定），并已声明进 reduce.cuh、注册进 main.cu 的被测内核表，可直接
+//      被同一套测试驱动复用；覆盖 n 所需的 grid 口径（ceil(n/(2*block))，
+//      即差异 1)）由 main.cu 的 GridFor 按“每线程元素数 = 2”计算后传入。
+//
+// 逻辑说明（blockDim.x = 8，看单个 block k；记其 16 个元素为
+//   a0..a15 = input[k*16 .. k*16+15]）：
+//   加载阶段：线程 tid 累加两个相距 blockDim.x = 8 的元素
+//     gid             = k*16 + tid      → 段内前半（a0..a7）
+//     gid + blockDim.x = k*16 + tid + 8 → 段内后半（a8..a15）
+//     首个加法在寄存器 val 中完成、不进共享内存，因此 smem 只保存“每线程
+//     2 元素之和”而非常规的原始元素。若某次加载越界（下标 >= n），跳过该
+//     次加法即可，等价于对越界元素补 0，不影响求和结果。
+//   smem 初始：[a0+a8  a1+a9  a2+a10 … a7+a15]（恰好 blockDim.x 个槽）
+//   折半归约（与 v2 完全相同）：stride 自 4 折半到 1，线程 tid 把 smem[tid]
+//   与 smem[tid+stride] 合并写回 smem[tid]，log2(8) = 3 轮后收敛到
+//   smem[0] = Σ block k 的 16 个元素，由 tid 0 写入 output[k]。
+//
+// 对比小结（设计推理：v3 已接入测试驱动并完成正确性回归，性能结论
+//   仍需以严格基准数据为准）：
+//   全局数据量不变（每元素仍被读一次、输出 grid 个部分和），预期收益主要在
+//   两处：① 全局加载从“每线程 1 次”变“每线程 2 次并行发出”，内存级并行
+//   提升、访存延迟更易被隐藏；② block 数减半，摊薄每 block 的固定开销
+//   （块间调度、部分和写回等）。注意：v3 仍是标量加载，未做 README 规划的
+//   float4 向量化；是否确有提升，需接入基准后以实测数据为准。
+//
+// 启动约束：
+//   * grid >= ceil(n / (2 * blockDim.x))：保证每个元素恰好被一个线程读到；
+//     实际 grid 超出该值时，多余 block 因 gid >= n 全部跳过加载、部分和为 0，
+//     不影响最终结果（“超配安全”，同 v0/v1/v2）；n == 0 时 grid 也须 >= 1。
+//   * block 应为 2 的幂（默认 256）：折半归约需要每轮区间恰好一分为二，且
+//     “段内前半 / 后半各占 blockDim.x 个元素”的成对加载也依赖这一设定。
+//   * 动态共享内存 = blockDim.x * sizeof(float) 字节：槽数虽与 v0/v1/v2
+//     相同（都为 blockDim.x 个），但语义不同——这里存“每线程 2 元素的
+//     预加和”，而 v0/v1/v2 存的是原始输入元素。
+//
+// 接入现状（本内核已正式接入，原“待办”均已完成）：
+//   * reduce.cuh：已补充声明，input 形参为 const float*，与 ReduceKernel 一致；
+//   * main.cu：已在 kKernels 内核表注册本内核，覆盖 n 所需的 grid 由 GridFor
+//     按“每线程元素数 = 2”计算（base = ceil(n / (2 * block))）。
+// ============================================================================
+__global__ void reduce_v3(const float* input, float* output, int n) {
+  // 动态共享内存：blockDim.x * sizeof(float) 字节（保存每线程 1 个预加和）。
+  extern __shared__ float smem[];
+
+  const int tid = threadIdx.x;                       // 块内线程编号
+  // 段基址 = blockIdx.x * (2 * blockDim.x)：本 block 覆盖 2 * blockDim.x 个元素。
+  const int gid = blockIdx.x * (2 * blockDim.x) + threadIdx.x;
+
+  // --- 阶段 1：数据加载（每线程 2 元素，寄存器内先求和再写 smem） --------------
+  // 线程 tid 累加“段内前半 gid”与“段内后半 gid + blockDim.x”：两次加载各自
+  // 在 warp 内连续、互不依赖；任一越界（>= n）即跳过，等价于对该元素补 0。
+  float val = 0.0f;
+  if (gid < n) val += input[gid];
+  if (gid + blockDim.x < n) val += input[gid + blockDim.x];
+  // 全部加载完成后，每个线程只写 1 个槽；同步后 smem 即为各线程的 2 元素
+  // 预加和，可以开始归约。
+  smem[tid] = val;
+  __syncthreads();
+
+  // --- 阶段 2：树形归约（折半步长，与 v2 相同） ----------------------------------
+  // block 内共有 blockDim.x 个预加和，stride 自 blockDim.x/2 每轮折半到 1，
+  // 线程 tid（tid < stride）把 smem[tid] 与 smem[tid+stride] 合并后写回
+  // smem[tid]，结果留在数组最前端连续槽，读写连续、无共享内存 bank 冲突。
+  // 每轮之间必须 __syncthreads：下一轮要读本轮刚写入的局部和，否则读到旧值。
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      smem[tid] += smem[tid + s];
+    }
+    __syncthreads();
+  }
+
+  // --- 阶段 3：写回部分和（与 v0/v1/v2 相同） ------------------------------------
   // tid 0 把收敛在 smem[0] 的块内和写入 output[blockIdx.x]；
   // 最终标量由调用方对 output[0, grid) 再做一次轻量求和得到。
   if (tid == 0) {

@@ -2,7 +2,7 @@
 // main.cu —— 一维归约算子的执行入口：注册被测内核并运行测试（正确性 + 性能）
 //
 // 职责
-//   本文件只做“执行”：把被测归约内核（reduce_v0 / reduce_v1 / reduce_v2…）
+//   本文件只做“执行”：把被测归约内核（reduce_v0 / reduce_v1 / reduce_v2 / reduce_v3…）
 //   注册给可复用测试驱动 test_reduce_kernel（声明见 test.cuh，实现见
 //   test.cu），按开关覆盖 正常流程 / 边界条件 / 异常与健壮性 三类场景，
 //   并以退出码汇总结果（0 = 全部通过，供脚本化使用）。
@@ -41,7 +41,7 @@
 #include <cstddef>  // std::size_t
 #include <cstdio>   // printf / std::snprintf
 
-#include "reduce.cuh"  // ReduceKernel 统一签名、reduce_v0 / reduce_v1 / reduce_v2 声明
+#include "reduce.cuh"  // ReduceKernel 统一签名、reduce_v0 … reduce_v3 声明
 #include "test.cuh"    // test_reduce_kernel 声明（内部经 reduce.cuh 引入算子接口）
 
 namespace {
@@ -56,17 +56,23 @@ constexpr int kBlock = 256;
 // ---------------------------------------------------------------------------
 // 被测内核表
 // ---------------------------------------------------------------------------
-// 每个条目对应一个符合 ReduceKernel 签名的归约内核。新增版本（reduce_v2…）
+// 每个条目对应一个符合 ReduceKernel 签名的归约内核。新增版本（reduce_v3…）
 // 时只需在数组末尾追加一项，下方所有场景会自动对新内核各跑一遍。
+//
+// elems_per_thread：每线程搬运/加载的输入元素数，决定“覆盖 n 所需的 grid”。
+//   v0/v1/v2 为 1（每 block 覆盖 block 个元素）；v3 为 2（每 block 覆盖
+//   2*block 个元素）。GridFor 据此为各内核计算覆盖 n 所需的最少 block 数。
 struct KernelEntry {
-  const char* name;     // 打印用名字（区分版本与寻址方式）
-  ReduceKernel kernel;  // 内核函数指针
+  const char* name;           // 打印用名字（区分版本与寻址方式）
+  ReduceKernel kernel;        // 内核函数指针
+  int elems_per_thread;       // 每线程加载的元素数（1 或 2…）
 };
 
 const KernelEntry kKernels[] = {
-    {"reduce_v0 (交错寻址)", reduce_v0},
-    {"reduce_v1 (连续寻址)", reduce_v1},
-    {"reduce_v2 (折半步长)", reduce_v2},
+    {"reduce_v0 (交错寻址)", reduce_v0, 1},
+    {"reduce_v1 (连续寻址)", reduce_v1, 1},
+    {"reduce_v2 (折半步长)", reduce_v2, 1},
+    {"reduce_v3 (每线程 2 元素)", reduce_v3, 2},
 };
 
 // ---------------------------------------------------------------------------
@@ -89,10 +95,14 @@ constexpr size_t CountOf(const Scenario (&)[N]) {
 }
 
 // 由场景参数计算实际启动的 grid 大小：
-//   base = ceil(n / block)；n == 0 时也必须至少 1（空 block 全走补 0 分支，
-//   结果恒为 0，可安全启动）；最后叠加 extra_grid 个冗余 block。
-int GridFor(int n, int block, int extra_grid) {
-  int base = (n + block - 1) / block;
+//   base = ceil(n / (block * elems_per_thread))——每个 block 覆盖
+//   block * elems_per_thread 个连续元素：v0/v1/v2 的 elems_per_thread = 1，
+//   v3 = 2（每线程展开 2 个元素），故覆盖同一 n 时 v3 所需 block 数减半。
+//   n == 0 时也必须至少 1（空 block 全走补 0 分支，结果恒为 0，可安全启动）；
+//   最后叠加 extra_grid 个冗余 block（超配安全：多余 block 全部补 0）。
+int GridFor(int n, int block, int elems_per_thread, int extra_grid) {
+  const int span = block * elems_per_thread;  // 每个 block 覆盖的元素跨度
+  int base = (n + span - 1) / span;
   if (base < 1) base = 1;
   return base + extra_grid;
 }
@@ -148,8 +158,9 @@ bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
       char full_name[192];
       std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
       const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
-                                         GridFor(s.n, kBlock, s.extra_grid), kBlock,
-                                         strict_benchmark);
+                                         GridFor(s.n, kBlock, kern.elems_per_thread,
+                                                 s.extra_grid),
+                                         kBlock, strict_benchmark);
       all_ok = ok && all_ok;
       local_passed += ok ? 1 : 0;
       local_total += 1;

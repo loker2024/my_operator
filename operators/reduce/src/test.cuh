@@ -33,8 +33,11 @@
 //   kernel_name       打印时显示的内核名，如 "reduce_v0"
 //   n                 输入元素个数，须 >= 0；n == 0 表示空输入（预期结果为 0，
 //                     驱动会照常启动 grid 个 block，内核全部走补 0 分支）
-//   grid              启动的 block 数，须 >= 1，且建议 >= ceil(n / block)
-//                     （大于该值也安全：多余 block 全补 0、部分和为 0）
+//   grid              启动的 block 数，须 >= 1；建议 >= “覆盖 n 所需的最少
+//                     block 数”（对每线程 1 元素的 v0/v1/v2 为 ceil(n/block)，
+//                     对每线程 2 元素的 v3 为 ceil(n/(2*block))，均由 main.cu
+//                     的 GridFor 按内核的每线程元素数计算后传入；大于该值也
+//                     安全：多余 block 全补 0、部分和为 0）
 //   block             每 block 线程数，须为 2 的幂（默认 256）
 //   strict_benchmark  true  时按严格口径采样并输出 P5/P95；
 //                     false 时快速模式（默认）：1 次预热 + 100 次迭代
