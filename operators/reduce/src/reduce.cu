@@ -4,7 +4,11 @@
 // 与 reduce.cuh 配对：本文件包含该头文件中全部函数的定义。
 // 当前包含：
 //   * reduce_cpu ：主机端参考实现（正确性基线）
-//   * reduce_v0  ：GPU 归约内核（交错寻址共享内存归约，每 block 一个部分和）
+//   * reduce_v0  ：GPU 归约内核 v0（交错寻址共享内存归约，每 block 一个部分和）
+//   * reduce_v1  ：GPU 归约内核 v1（连续寻址共享内存归约，每 block 一个部分和）
+//
+// v0 与 v1 的网格/块模型与启动约束完全相同（同一份测试驱动可直接复用），
+// 区别仅在于块内树形归约的“活跃线程寻址方式”，详见各函数前的注释。
 //
 // 本文件不包含 main()，也不包含测试代码。算子测试按职责拆分：
 //   test.cuh / test.cu  可复用测试驱动（声明 + 实现）
@@ -60,7 +64,7 @@ __global__ void reduce_v0(const float* input, float* output, int n) {
   // 每轮结束后必须再次同步：下一轮读的是本轮刚写入的局部和，若不同步
   // 可能读到上一轮（甚至更早）的旧值。缺点：每轮活跃线程减半，后半段
   // 出现大量空转线程与 warp 分歧——这正是 v0 只作为正确性基线的理由。
-  for (int step = 1; step < blockDim.x; step *= 2) {
+  for (size_t step = 1; step < blockDim.x; step *= 2) {
     if (tid % (2 * step) == 0) {
       smem[tid] += smem[tid + step];
     }
@@ -70,6 +74,90 @@ __global__ void reduce_v0(const float* input, float* output, int n) {
   // --- 阶段 3：写回部分和 ----------------------------------------------
   // 归约结束后，整个 block 负责段的和在 smem[0]，由 tid 0 写入
   // output[blockIdx.x]；最终标量和由调用方对 output[0, grid) 二次求和。
+  if (tid == 0) {
+    output[blockIdx.x] = smem[0];
+  }
+}
+
+// ============================================================================
+// reduce_v1 —— GPU 归约内核（连续寻址，consecutive addressing）
+// ============================================================================
+// 与 v0 的差异：块内树形归约不再让“交错间隔”的线程活跃，而是让每轮
+// 活跃线程构成**连续前缀**，从而避免 v0 那种同一 warp 内活跃/空闲线程
+// 交错排布带来的线程分歧；网格划分、补 0、动态共享内存与输出约定均同 v0。
+//
+// 逻辑说明（以 blockDim.x = 8 为例）：
+//   smem 初始： [a0 a1 a2 a3 a4 a5 a6 a7]   （每个槽为对应输入元素）
+//   第 1 轮 (step=1)：index = tid*2，活跃 tid ∈ [0,4)
+//     tid0: smem[0] += smem[1]  → a0+a1          tid1: smem[2] += smem[3]  → a2+a3
+//     tid2: smem[4] += smem[5]  → a4+a5          tid3: smem[6] += smem[7]  → a6+a7
+//     结果： [a0+a1 .. a2+a3 .. a4+a5 .. a6+a7 ..]（槽 0/2/4/6 保存局部和）
+//   第 2 轮 (step=2)：index = tid*4，活跃 tid ∈ [0,2)
+//     tid0: smem[0] += smem[2] → Σa0..a3        tid1: smem[4] += smem[6] → Σa4..a7
+//   第 3 轮 (step=4)：index = tid*8，仅 tid0 满足 index < blockDim.x
+//     tid0: smem[0] += smem[4] → Σa0..a7（收敛）
+//   log2(blockDim.x) 轮后总和收敛到 smem[0]。
+//
+// 活跃线程形态对比（blockDim.x = 256）：
+//   v0 交错寻址：active 条件为 tid % (2*step) == 0，活跃 lane 在 warp 内
+//     均匀间隔分布，如第 1 轮每个 warp 只动用 0/2/4/…/30 共 16 个 lane，
+//     其余 lane 空转，形成 warp 内分歧；
+//   v1 连续寻址：active 条件为 index < blockDim.x，即 tid 属于连续前缀
+//     [0, blockDim.x/(2*step))，故“整条 warp 要么全活跃、要么全空闲”，
+//     消除了 v0 的 warp 内分歧，指令调度更规整。
+//   注意：两者每轮参与线程总数相同（blockDim.x/2 递减），v1 并不减少
+//   计算量，只改善线程占用形态，是“代价最小”的 v0 直接改进。
+//
+// 参数：
+//   input  —— 设备端输入数组 input[0, n)，须为已分配的有效全局内存；
+//   output —— 设备端输出数组，本 block 的部分和写入 output[blockIdx.x]，
+//             故 output 至少要有 grid 个元素（调用方负责分配）；
+//   n      —— 输入元素个数，须 >= 0 且 grid * blockDim.x 覆盖的范围可
+//             以超出 n（越界部分由补 0 逻辑兜底，见下）。
+// 返回值：无（结果写入 output[blockIdx.x]）。
+//
+// 启动约束（由调用方保证，与 v0 相同）：
+//   * grid >= ceil(n / block)，使每个输入元素恰好被一个线程读到；若实际
+//     启动的 grid 大于该值，多余的 block 因 gid >= n 全部补 0，其部分和
+//     为 0，不会改变最终结果（该“超配安全”性质被测试显式覆盖）；
+//   * block 应为 2 的幂（默认 256）：本内核靠 step 倍增逼近 blockDim.x，
+//     只有 2 的幂才能让每轮下标不重叠、最终恰好收敛到 smem[0]；
+//   * 动态共享内存 = block * sizeof(float) 字节，由启动配置第三参数给出。
+// ============================================================================
+__global__ void reduce_v1(const float* input, float* output, int n) {
+  // 动态共享内存：每个 block 的私有副本，大小由启动配置第三参数指定。
+  extern __shared__ float smem[];
+
+  const int tid = threadIdx.x;                            // 块内线程编号
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;  // 全局元素下标
+
+  // --- 阶段 1：数据加载（与 v0 相同） ------------------------------------
+  // 每个线程搬 1 个元素到 smem[tid]；越界（gid >= n）补 0，既保证求和
+  // 结果不变，也保证后续各轮归约读写不越界、不读未初始化数据。
+  smem[tid] = (gid < n) ? input[gid] : 0.0f;
+  // 等待全部槽位就绪后才能开始归约。
+  __syncthreads();
+
+  // --- 阶段 2：树形归约（连续寻址） --------------------------------------
+  // 每轮 step 倍增（1, 2, 4, …），线程 tid 负责把槽位
+  //   index     = tid * 2 * step
+  //   index+step
+  // 两个局部和合并到 smem[index]。活跃条件 index < blockDim.x 等价于
+  // tid < blockDim.x / (2 * step)，即活跃线程构成连续前缀。合并结果写入
+  // 偶数下标槽，最终收敛到 smem[0]。
+  // 每轮之间必须 __syncthreads：下一轮要读本轮刚写入的局部和，不同步会
+  // 读到旧值。与 v0 不同之处仅在于活跃线程从“交错”变为“连续前缀”。
+  for (size_t step = 1; step < blockDim.x; step *= 2) {
+    const int index = 2 * static_cast<int>(step) * tid;
+    if (index < blockDim.x) {
+      smem[index] += smem[index + static_cast<int>(step)];
+    }
+    __syncthreads();
+  }
+
+  // --- 阶段 3：写回部分和（与 v0 相同） ----------------------------------
+  // tid 0 把收敛在 smem[0] 的块内和写入 output[blockIdx.x]；
+  // 最终标量由调用方对 output[0, grid) 再做一次轻量求和得到。
   if (tid == 0) {
     output[blockIdx.x] = smem[0];
   }

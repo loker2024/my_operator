@@ -1,19 +1,22 @@
 // ============================================================================
-// main.cu —— 一维归约算子的执行入口：运行测试（基准）
+// main.cu —— 一维归约算子的执行入口：注册被测内核并运行测试（正确性 + 性能）
 //
 // 职责
-//   本文件只做“执行”：把被测的归约内核（reduce_v0，未来 v1/v2…）依次注册
-//   给 test_reduce_kernel（声明见 test.cuh，实现见 test.cu），完成全部测试并
-//   以退出码汇报结果（0 = 全部通过）。
+//   本文件只做“执行”：把被测归约内核（reduce_v0 / reduce_v1，未来 v2…）
+//   注册给可复用测试驱动 test_reduce_kernel（声明见 test.cuh，实现见
+//   test.cu），逐一覆盖 正常流程 / 边界条件 / 异常与健壮性 三类场景，
+//   并以退出码汇总结果（0 = 全部通过，供脚本化使用）。
 //
 // 新增内核版本的接入方式（可复用测试的关键）：
-//   只需在 main() 里照抄一行 test_reduce_kernel(...) 并更换第一个参数，
-//   例如 reduce_v1、reduce_v2；无需改动任何测试代码。
+//   只需在下方 kernels 表追加一项 { 名字, 内核指针 }，即可自动对所有
+//   场景复用同一套测试代码；无需改动测试驱动 test.cu 或场景表。
 //
-// 各文件职责总览
-//   reduce.cuh / reduce.cu   算子接口声明与实现（被测试对象）
-//   test.cuh  / test.cu      可复用测试驱动的声明与实现
-//   main.cu                  执行入口（本文件）
+// 场景设计（各类别的意图与覆盖点，详见各场景组的注释）：
+//   A. 正常流程 —— 常规大规模形状，验证基本正确性与性能；
+//   B. 边界条件 —— 极小规模、恰好落在 block 边界附近 / 整 block 满载的
+//      形状，覆盖“末尾 block 不满、多数线程补 0”与“grid 恰好为 1”等路径；
+//   C. 异常与健壮性 —— 空输入（n == 0）、非法参数契约（由 test.cu 参数
+//      防御判 FAIL 而不崩溃）、超配 grid（多余 block 全补 0 不影响结果）。
 //
 // 构建与运行（仓库根目录）：
 //   CMake：  cmake -S . -B build && cmake --build build --target reduce
@@ -22,34 +25,141 @@
 //   nvcc -std=c++17 -arch=native -I common/include \
 //        operators/reduce/src/reduce.cu operators/reduce/src/test.cu \
 //        operators/reduce/src/main.cu -o /tmp/reduce_run && /tmp/reduce_run
+//
+// 各文件职责总览
+//   reduce.cuh / reduce.cu   算子接口声明与实现（被测试对象）
+//   test.cuh  / test.cu      可复用测试驱动的声明与实现
+//   main.cu                  执行入口（本文件）
 // ============================================================================
 
-#include <cstdio>  // printf
+#include <cstdio>  // printf / std::snprintf
 
+#include "reduce.cuh"  // ReduceKernel 统一签名、reduce_v0 / reduce_v1 声明
 #include "test.cuh"    // test_reduce_kernel 声明（内部经 reduce.cuh 引入算子接口）
-#include "reduce.cuh"  // reduce_v0 等被测内核的声明（与 test.cuh 同源，显式写清依赖）
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// 全局配置
+// ---------------------------------------------------------------------------
+
+// 每 block 线程数：所有内核都要求为 2 的幂（本文件所有场景共用）。
+constexpr int kBlock = 256;
+
+// ---------------------------------------------------------------------------
+// 被测内核表
+// ---------------------------------------------------------------------------
+// 每个条目对应一个符合 ReduceKernel 签名的归约内核。新增版本（reduce_v2…）
+// 时只需在数组末尾追加一项，下方所有场景会自动对新内核各跑一遍。
+struct KernelEntry {
+  const char* name;     // 打印用名字（区分版本与寻址方式）
+  ReduceKernel kernel;  // 内核函数指针
+};
+
+const KernelEntry kKernels[] = {
+    {"reduce_v0 (交错寻址)", reduce_v0},
+    {"reduce_v1 (连续寻址)", reduce_v1},
+};
+
+// ---------------------------------------------------------------------------
+// 测试场景表
+// ---------------------------------------------------------------------------
+// label       仅用于打印，帮助区分场景意图；
+// n           输入元素个数；
+// extra_grid  在“恰好覆盖 n 所需的 block 数”基础上额外多启动的 block 数，
+//             用于验证“超配 grid”时多余 block 全部补 0、不改变归约结果。
+struct Scenario {
+  const char* label;
+  int n;
+  int extra_grid;
+};
+
+// 由场景参数计算实际启动的 grid 大小：
+//   base = ceil(n / block)；n == 0 时也必须至少 1（空 block 全走补 0 分支，
+//   结果恒为 0，可安全启动）；最后叠加 extra_grid 个冗余 block。
+int GridFor(int n, int block, int extra_grid) {
+  int base = (n + block - 1) / block;
+  if (base < 1) base = 1;
+  return base + extra_grid;
+}
+
+// 场景组 A：正常流程 —— 常规大规模形状（grid 恰好覆盖输入）。
+const Scenario kNormalScenarios[] = {
+    {"正常: n=2^20, 对齐", 1 << 20, 0},
+    {"正常: n=2^20+1000, 尾部非对齐", (1 << 20) + 1000, 0},
+};
+
+// 场景组 B：边界条件 —— 极小规模与 block 边界附近 / 整 block 满载的形状，
+// 覆盖补 0、单 block、双 block（第二个 block 只有少量有效元素）等路径。
+const Scenario kBoundaryScenarios[] = {
+    {"边界: n=1, 单元素", 1, 0},
+    {"边界: n=block, 恰 1 个 block 满载", kBlock, 0},
+    {"边界: n=block-1, 差 1 满载", kBlock - 1, 0},
+    {"边界: n=block+1, 需 2 个 block", kBlock + 1, 0},
+    {"边界: n=2*block-1, 第 2 个 block 仅 1 个有效元素", 2 * kBlock - 1, 0},
+};
+
+// 场景组 C：异常 / 健壮性 —— 空输入、超配 grid、非法契约。
+const Scenario kAbnormalScenarios[] = {
+    {"异常: n=0, 空输入 (期望和=0)", 0, 0},
+    {"健壮: n=2^18, grid 超配 +3 个冗余 block", 1 << 18, 3},
+};
+
+}  // namespace
 
 int main() {
-  const int block = 256;
-
-  // 场景 1：标准长度（n 恰好是 block 的整数倍）。
-  const int n1 = 1 << 20;
-  // 场景 2：尾部非对齐（n2 不是 block 整数倍），覆盖越界线程补 0 的路径。
-  const int n2 = (1 << 20) + 1000;
-
   std::printf("==== Reduce 测试：正确性(容差 1e-3) + 性能 ====\n");
-  bool all_ok = true;
-  all_ok = test_reduce_kernel(reduce_v0, "reduce_v0", n1, (n1 + block - 1) / block,
-                              block) &&
-           all_ok;
-  all_ok = test_reduce_kernel(reduce_v0, "reduce_v0(尾部非对齐)", n2,
-                              (n2 + block - 1) / block, block) &&
-           all_ok;
-  // 可选：严格基准模式（耗时较长），例如
-  //   all_ok = test_reduce_kernel(reduce_v0, "reduce_v0(strict)", n1,
-  //                               (n1 + block - 1) / block, block,
-  //                               /*strict_benchmark=*/true) && all_ok;
+  std::printf("block = %d；被测内核 %zu 个，各跑 3 组场景（正常/边界/异常）\n\n",
+              kBlock, sizeof(kKernels) / sizeof(kKernels[0]));
 
-  std::printf("==== 结果：%s ====\n", all_ok ? "全部 PASS" : "存在 FAIL");
+  bool all_ok = true;
+  int passed = 0;
+  int total = 0;
+
+  for (const KernelEntry& kern : kKernels) {
+    std::printf("---------------- %s ----------------\n", kern.name);
+
+    // 场景组 A：正常流程。
+    std::printf("== [A] 正常流程 ==\n");
+    for (const Scenario& s : kNormalScenarios) {
+      char full_name[192];
+      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
+      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
+                                         GridFor(s.n, kBlock, s.extra_grid), kBlock);
+      all_ok = ok && all_ok;
+      passed += ok ? 1 : 0;
+      total += 1;
+    }
+
+    // 场景组 B：边界条件。
+    std::printf("== [B] 边界条件 ==\n");
+    for (const Scenario& s : kBoundaryScenarios) {
+      char full_name[192];
+      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
+      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
+                                         GridFor(s.n, kBlock, s.extra_grid), kBlock);
+      all_ok = ok && all_ok;
+      passed += ok ? 1 : 0;
+      total += 1;
+    }
+
+    // 场景组 C：异常 / 健壮性。
+    std::printf("== [C] 异常与健壮性 ==\n");
+    for (const Scenario& s : kAbnormalScenarios) {
+      char full_name[192];
+      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
+      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
+                                         GridFor(s.n, kBlock, s.extra_grid), kBlock);
+      all_ok = ok && all_ok;
+      passed += ok ? 1 : 0;
+      total += 1;
+    }
+
+    std::printf("\n");
+  }
+
+  // 汇总：正确性全部通过则退出码 0，否则 1（便于脚本化判断）。
+  std::printf("==== 结果：%d/%d 项 PASS，%s ====\n", passed, total,
+              all_ok ? "全部通过" : "存在 FAIL");
   return all_ok ? 0 : 1;
 }

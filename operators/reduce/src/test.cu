@@ -33,6 +33,16 @@ bool test_reduce_kernel(ReduceKernel kernel, const char* kernel_name, int n,
   const int iterations = strict_benchmark ? 10000 : 100;
   const int sample_count = strict_benchmark ? 21 : 1;
 
+  // --- 0. 参数防御（异常情况：非法输入直接判 FAIL，避免底层 API 报错）-----
+  // n < 0 无意义（负长度）；grid < 1 时既无法完成两阶段归约，也会让下面
+  // 的 cudaMalloc(d_output, 0) 落入未定义行为。因此把约束显式化：任何违反
+  // 该契约的调用都记为 FAIL（返回 false），而不是带崩测试进程。
+  if (n < 0 || grid < 1) {
+    std::printf("[%s] 非法参数: n=%d, grid=%d (契约: n>=0 且 grid>=1)  ->  FAIL\n",
+                kernel_name, n, grid);
+    return false;
+  }
+
   // --- 1. 生成可复现的测试数据，并计算 CPU 参考值 --------------------------
   // 输入取 (i % 1000)：确定性生成、可复现（等价固定种子伪随机），
   // 同时保证和为较大的正数，避免求和因正负抵消而退化、放大相对误差。
@@ -45,11 +55,18 @@ bool test_reduce_kernel(ReduceKernel kernel, const char* kernel_name, int n,
 
   // --- 2. 分配设备内存并拷入输入 ------------------------------------------
   // d_output 长度 = grid：每个 block 恰好写 1 个部分和。
+  // 边界情况 n == 0（空输入）时的处理：cudaMalloc(0) 返回的指针是否可用
+  // 未作统一保证，故输入侧按 max(n, 1) 申请，宁多不少；内核在 gid >= n
+  // （n == 0 时全部成立）时走“补 0”分支不会触碰 d_input，结果恒为 0，
+  // 因此只需保证“能启动、能安全写 output”，即完成对空输入路径的覆盖。
   float *d_input = nullptr, *d_output = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_input, n * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_output, grid * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), n * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  const size_t in_bytes = static_cast<size_t>(std::max(n, 1)) * sizeof(float);
+  CUDA_CHECK(cudaMalloc(&d_input, in_bytes));
+  CUDA_CHECK(cudaMalloc(&d_output, static_cast<size_t>(grid) * sizeof(float)));
+  if (n > 0) {  // n == 0 时无可拷数据（h_input 为空），跳过拷贝
+    CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), static_cast<size_t>(n) * sizeof(float),
+                          cudaMemcpyHostToDevice));
+  }
 
   // --- 3. 准备启动配置（统一签名 + 统一动态共享内存） ----------------------
   const dim3 grid_dim(grid);

@@ -17,11 +17,13 @@
 //             写入 output[blockIdx.x]（故 output 至少要有 grid 个元素）；
 //     阶段 2：由调用方把 grid 个部分和再汇总一次，得到最终标量。
 //
-// 版本规划
-//   v0 为当前唯一实现（交错寻址共享内存归约，作为正确性基线）。
-//   后续版本（v1 连续寻址、v2 反向步长……）将保持与 v0 完全一致的
-//   ReduceKernel 签名，从而可被 test.cuh / test.cu 中的同一套测试驱动
-//   直接复用（只需在 main.cu 更换传给 test_reduce_kernel 的内核名）。
+// 版本规划（实现现状）
+//   v0 交错寻址共享内存归约（interleaved addressing）——正确性基线。
+//   v1 连续寻址共享内存归约（consecutive addressing）——把 v0 每轮的
+//      活跃线程从“交错间隔”改为“连续前缀”，消除 warp 内分歧。
+//   后续版本（v2 每线程多元素 + float4 向量化、v3 反向步长等）将保持与
+//   v0/v1 完全一致的 ReduceKernel 签名与启动模型，从而可被 test.cuh /
+//   test.cu 中的同一套测试驱动直接复用（只需在 main.cu 更换内核名）。
 //
 // 正确性口径见 docs/benchmark-methodology.md：Reduce 相对误差容差 1e-3。
 // ============================================================================
@@ -51,6 +53,18 @@ float reduce_cpu(const float* input, int n);
 __global__ void reduce_v0(const float* input, float* output, int n);
 
 // ---------------------------------------------------------------------------
+// GPU 归约内核 v1（连续寻址共享内存归约）
+// ---------------------------------------------------------------------------
+// 网格/块模型、输出约定与启动约束和 v0 完全一致（每 block 一段连续元素 →
+// 1 个部分和写入 output[blockIdx.x]），差异只在块内树形归约的寻址方式：
+//   * v0：活跃线程条件 tid % (2*step) == 0，交错分布，存在 warp 内分歧；
+//   * v1：活跃线程是连续前缀 tid < blockDim.x/(2*step)（等价地
+//          index = tid*2*step < blockDim.x），整条 warp 全活跃或全空闲，
+//          warp 内无分歧。
+// 详细推导、示例与注意事项见 reduce.cu 中本内核的定义处注释。
+__global__ void reduce_v1(const float* input, float* output, int n);
+
+// ---------------------------------------------------------------------------
 // 归约内核的统一签名
 // ---------------------------------------------------------------------------
 // 各版本 GPU 归约内核均按 (const float* 输入, float* 部分和输出, int 长度)
@@ -59,3 +73,4 @@ __global__ void reduce_v0(const float* input, float* output, int n);
 // 内核函数指针”从而对任意版本复用同一套测试代码（对应旧版 Reduce/src/reduce.cu
 // 的 testReduceKernel，见学习笔记 §14）。
 using ReduceKernel = void (*)(const float* input, float* output, int n);
+// ============================ reduce.cuh end ===============================

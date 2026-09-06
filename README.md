@@ -16,7 +16,7 @@
 | Softmax | fp32，行主序、逐行归一化 | 规划中 | 规划中 | `operators/softmax` |
 | GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 规划中 | 规划中 | `operators/gemm` |
 | Attention | 单头、fp32、无 mask | 规划中 | 规划中 | `operators/attention` |
-| Reduce | fp32 行求和，`out[i]=Σ_j x[i,j]`，可扩展列/全归约 | 规划中 | 规划中 | `operators/reduce` |
+| Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 进行中（v0/v1） | 规划中 | `operators/reduce` |
 
 状态说明：
 
@@ -100,7 +100,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
 - [ ] Softmax：CUDA 核心版本（v0 → 优化变体）
 - [ ] GEMM：CUDA 核心版本（v0 → 优化变体）
 - [ ] Attention：CUDA 核心版本（v0 → Flash 风格）
-- [ ] Reduce：CUDA 核心版本（v0 → 优化变体）
+- [x] Reduce：CUDA 核心版本（v0 → 优化变体）   <!-- v0 交错寻址基线 + v1 连续寻址，18 项测试通过 -->
 - [ ] 各算子正确性验证与基准记录
 - [ ] 逐个补充 Triton 版本，与 CUDA 对齐并对照性能
 
