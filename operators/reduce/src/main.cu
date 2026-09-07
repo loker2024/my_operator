@@ -1,71 +1,31 @@
 // ============================================================================
-// main.cu —— 一维归约算子的执行入口：注册被测内核并运行测试（正确性 + 性能）
+// main.cu —— Reduce 测试执行入口：把被测内核注册给可复用测试驱动
+// test_reduce_kernel（声明 test.cuh / 实现 test.cu），按开关跑三类场景，退出码
+// 0 = 全部通过。
 //
-// 职责
-//   本文件只做“执行”：把被测归约内核（reduce_v0 / reduce_v1 / reduce_v2 / reduce_v3…）
-//   注册给可复用测试驱动 test_reduce_kernel（声明见 test.cuh，实现见
-//   test.cu），按开关覆盖 正常流程 / 边界条件 / 异常与健壮性 三类场景，
-//   并以退出码汇总结果（0 = 全部通过，供脚本化使用）。
+// 接入新版本内核：在 reduce.cuh/.cu 添加声明与实现后，只需向下方 kKernels 表
+// 追加 {名字, 函数指针, 每线程元素数} 一项，即可自动复用全部测试场景。
 //
-// 新增内核版本的接入方式（可复用测试的关键）：
-//   只需在下方 kernels 表追加一项 { 名字, 内核指针 }，即可自动对所有
-//   场景复用同一套测试代码；无需改动测试驱动 test.cu 或场景表。
-//
-// 两个开关（均为函数参数，默认关闭；见 RunScenarios 的注释）：
-//   enable_boundary   是否执行边界条件与异常/健壮性场景；
-//   strict_benchmark  是否按严格口径采样性能（与 test_reduce_kernel 同名参数一致）。
-//   默认状态下只跑“正常流程 + 快速性能口径”，日常开发迭代最快；需要全量
-//   回归或出严格基准数字时，把 main() 中的开关改为 true 即可。
-//
-// 场景设计（各类别的意图与覆盖点，详见各场景组的注释）：
-//   A. 正常流程 —— 常规大规模形状，验证基本正确性与性能；
-//   B. 边界条件 —— 极小规模、恰好落在 block 边界附近 / 整 block 满载的
-//      形状，覆盖“末尾 block 不满、多数线程补 0”与“grid 恰好为 1”等路径；
-//   C. 异常与健壮性 —— 空输入（n == 0）、非法参数契约（由 test.cu 参数
-//      防御判 FAIL 而不崩溃）、超配 grid（多余 block 全补 0 不影响结果）。
-//
-// 构建与运行（仓库根目录）：
-//   CMake：  cmake -S . -B build && cmake --build build --target reduce
-//            ./build/operators/reduce/reduce
-//   或直接 nvcc（无需触碰工程构建目录）：
-//   nvcc -std=c++17 -arch=native -I common/include \
-//        operators/reduce/src/reduce.cu operators/reduce/src/test.cu \
-//        operators/reduce/src/main.cu -o /tmp/reduce_run && /tmp/reduce_run
-//
-// 各文件职责总览
-//   reduce.cuh / reduce.cu   算子接口声明与实现（被测试对象）
-//   test.cuh  / test.cu      可复用测试驱动的声明与实现
-//   main.cu                  执行入口（本文件）
+// 构建：cmake --build build --target reduce && ./build/operators/reduce/reduce
 // ============================================================================
 
 #include <cstddef>  // std::size_t
 #include <cstdio>   // printf / std::snprintf
 
-#include "reduce.cuh"  // ReduceKernel 统一签名、reduce_v0 … reduce_v3 声明
-#include "test.cuh"    // test_reduce_kernel 声明（内部经 reduce.cuh 引入算子接口）
+#include "reduce.cuh"
+#include "test.cuh"
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// 全局配置
-// ---------------------------------------------------------------------------
-
-// 每 block 线程数：所有内核都要求为 2 的幂（本文件所有场景共用）。
+// 每 block 线程数（各内核均要求为 2 的幂；v4 另要求 >= 64）。
 constexpr int kBlock = 256;
 
-// ---------------------------------------------------------------------------
-// 被测内核表
-// ---------------------------------------------------------------------------
-// 每个条目对应一个符合 ReduceKernel 签名的归约内核。新增版本（reduce_v3…）
-// 时只需在数组末尾追加一项，下方所有场景会自动对新内核各跑一遍。
-//
-// elems_per_thread：每线程搬运/加载的输入元素数，决定“覆盖 n 所需的 grid”。
-//   v0/v1/v2 为 1（每 block 覆盖 block 个元素）；v3 为 2（每 block 覆盖
-//   2*block 个元素）。GridFor 据此为各内核计算覆盖 n 所需的最少 block 数。
+// 被测内核表。elems_per_thread：每线程加载的输入元素数，决定“覆盖 n 所需的
+// grid”——v0/v1/v2 为 1，v3/v4 为 2（grid 减半），GridFor 据此计算。
 struct KernelEntry {
-  const char* name;           // 打印用名字（区分版本与寻址方式）
+  const char* name;           // 打印用名字
   ReduceKernel kernel;        // 内核函数指针
-  int elems_per_thread;       // 每线程加载的元素数（1 或 2…）
+  int elems_per_thread;       // 每线程加载的元素数
 };
 
 const KernelEntry kKernels[] = {
@@ -73,41 +33,34 @@ const KernelEntry kKernels[] = {
     {"reduce_v1 (连续寻址)", reduce_v1, 1},
     {"reduce_v2 (折半步长)", reduce_v2, 1},
     {"reduce_v3 (每线程 2 元素)", reduce_v3, 2},
+    {"reduce_v4 (每线程 2 元素 + warp 归约)", reduce_v4, 2},
 };
 
-// ---------------------------------------------------------------------------
-// 测试场景表
-// ---------------------------------------------------------------------------
-// label       仅用于打印，帮助区分场景意图；
-// n           输入元素个数；
-// extra_grid  在“恰好覆盖 n 所需的 block 数”基础上额外多启动的 block 数，
-//             用于验证“超配 grid”时多余 block 全部补 0、不改变归约结果。
+// 测试场景。label 仅用于打印；n 为输入元素个数；extra_grid 为在“恰好覆盖 n 的
+// block 数”基础上额外多配的 block 数（验证“超配安全”）。
 struct Scenario {
   const char* label;
   int n;
   int extra_grid;
 };
 
-// 编译期取场景表长度（配合下方基于数组的场景表，避免手写个数）。
 template <size_t N>
 constexpr size_t CountOf(const Scenario (&)[N]) {
   return N;
 }
 
-// 由场景参数计算实际启动的 grid 大小：
-//   base = ceil(n / (block * elems_per_thread))——每个 block 覆盖
-//   block * elems_per_thread 个连续元素：v0/v1/v2 的 elems_per_thread = 1，
-//   v3 = 2（每线程展开 2 个元素），故覆盖同一 n 时 v3 所需 block 数减半。
-//   n == 0 时也必须至少 1（空 block 全走补 0 分支，结果恒为 0，可安全启动）；
-//   最后叠加 extra_grid 个冗余 block（超配安全：多余 block 全部补 0）。
+// 由场景求实际启动的 grid：
+//   base = ceil(n / (block * elems_per_thread))，每 block 覆盖
+//   block * elems_per_thread 个连续元素；n == 0 时 base 至少为 1；
+//   再叠加 extra_grid 个冗余 block。
 int GridFor(int n, int block, int elems_per_thread, int extra_grid) {
-  const int span = block * elems_per_thread;  // 每个 block 覆盖的元素跨度
+  const int span = block * elems_per_thread;
   int base = (n + span - 1) / span;
   if (base < 1) base = 1;
   return base + extra_grid;
 }
 
-// 场景组 A：正常流程 —— 常规大规模形状（grid 恰好覆盖输入）。
+// 场景组 A：正常流程 —— 大规模形状（grid 恰好覆盖输入）。
 const Scenario kNormalScenarios[] = {
     {"正常: n=2^20, 对齐", 1 << 20, 0},
     {"正常: n=2^20+1000, 尾部非对齐", (1 << 20) + 1000, 0},
@@ -123,27 +76,15 @@ const Scenario kBoundaryScenarios[] = {
     {"边界: n=2*block-1, 第 2 个 block 仅 1 个有效元素", 2 * kBlock - 1, 0},
 };
 
-// 场景组 C：异常 / 健壮性 —— 空输入、超配 grid、非法契约。
+// 场景组 C：异常 / 健壮性 —— 空输入、超配 grid。
 const Scenario kAbnormalScenarios[] = {
     {"异常: n=0, 空输入 (期望和=0)", 0, 0},
     {"健壮: n=2^18, grid 超配 +3 个冗余 block", 1 << 18, 3},
 };
 
-// ---------------------------------------------------------------------------
-// 场景执行
-// ---------------------------------------------------------------------------
-// 对单个内核跑一遍场景，返回 true 表示该内核全部 PASS。
-//
-// 开关（均为函数参数，默认关闭）：
-//   enable_boundary   true  时执行 B 组（边界条件）与 C 组（异常/健壮性）；
-//                     false（默认）时只跑 A 组正常流程，并在报告中标注跳过，
-//                     避免日常迭代被大量极小形状（无性能意义的用例）拖慢。
-//   strict_benchmark  true  时按严格口径采样（1000 预热 + 21 组 × 10000 次，
-//                     输出中位数与 P5/P95）；false（默认）时快速模式（1 预热
-//                     + 100 次）。该开关透传给 test_reduce_kernel 的同名参数，
-//                     两处口径保持一致。
-//
-// passed / total 可选：非空时累加本次执行的 PASS 数与用例总数，便于 main 汇总。
+// 对单个内核跑一遍启用场景，返回该内核是否全部 PASS。
+// 开关：enable_boundary 执行 B/C 组（默认只跑 A 组正常流程，避免极小形状拖慢
+// 日常迭代）；strict_benchmark 透传给 test_reduce_kernel 的严格采样口径。
 bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
                   bool strict_benchmark = false, int* passed = nullptr,
                   int* total = nullptr) {
@@ -184,8 +125,8 @@ bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
 }  // namespace
 
 int main() {
-  // 开关集中在此处，默认均关闭：只跑正常流程 + 快速性能口径。
-  // 需要全量回归（含边界条件 / 异常与健壮性）或严格基准数字时，改为 true。
+  // 开关集中在此，默认关闭：只跑正常流程 + 快速性能。需要全量回归或严格基准时
+  // 改为 true。
   constexpr bool kEnableBoundary = false;
   constexpr bool kStrictBenchmark = false;
 
@@ -207,7 +148,7 @@ int main() {
     std::printf("\n");
   }
 
-  // 汇总：正确性全部通过则退出码 0，否则 1（便于脚本化判断）。
+  // 正确性全部通过则退出码 0，否则 1（便于脚本化判断）。
   std::printf("==== 结果：%d/%d 项 PASS，%s ====\n", passed, total,
               all_ok ? "全部通过" : "存在 FAIL");
   return all_ok ? 0 : 1;

@@ -17,3 +17,4 @@
 - 2026-09-06 12:58 `operators/reduce`：为 v0/v1 内核补齐模块、函数与关键逻辑注释（参数 / 返回值 / 启动约束 / 注意事项），并同步文档（`CHANGELOG.md`、顶层与算子 `README.md`）。
 - 2026-09-06 13:09 `operators/reduce`：测试入口 `main.cu` 新增两个开关（函数参数形式，默认关闭）—— `enable_boundary` 控制边界条件与异常 / 健壮性场景（默认只跑正常流程 4 项，开启后 18 项全量回归）、`strict_benchmark` 控制严格性能口径（透传给 `test_reduce_kernel`）；重复场景循环收敛为 `RunScenarios`，场景表长度编译期推导。
 - 2026-09-06 14:49 `operators/reduce`：`reduce_v3`（每线程 2 元素展开）由实验性实现正式接入——签名统一为 `ReduceKernel`（`const float*`）并声明加入 `reduce.cuh`，注册进 `main.cu` 被测内核表；`GridFor` 改为按内核“每线程元素数”计算覆盖 grid（v3 覆盖同一 `n` 所需 block 减半）；同步实现注释、`test.cuh` 注释与算子 `README.md`（状态表 / 版本规划）。
+- 2026-09-07 10:58 `operators/reduce`：新增并接入 `reduce_v4`（每线程 2 元素 + 末 warp 展开归约，volatile 共享内存收尾省去 5 轮 `__syncthreads`）——修正草稿的段基址与越界判定，声明加入 `reduce.cuh`、注册进 `main.cu` 被测内核表，全量回归 5 内核 × 9 场景 45 项全部通过；`reduce_v4` 正常流程严格基准 251.5 GB/s（n=2^20）。同时精简算子源码注释：`cu`/`cuh` 声明与实现注释去重、删除冗余推导细节（并入算子 `README.md` / `docs`），并同步 `test.cuh`/`test.cu`/`main.cu` 注释。
