@@ -4,7 +4,9 @@
 // 0 = 全部通过。
 //
 // 接入新版本内核：在 reduce.cuh/.cu 添加声明与实现后，只需向下方 kKernels 表
-// 追加 {名字, 函数指针, 每线程元素数} 一项，即可自动复用全部测试场景。
+// 追加 {名字, 函数指针, 每线程元素数} 一项，即可自动复用全部测试场景。模板
+// 内核（reduce_v5）取固定实例 reduce_v5<kBlock> 作为函数指针（实例化声明见
+// reduce.cuh，显式实例化定义见 reduce.cu）。
 //
 // 构建：cmake --build build --target reduce && ./build/operators/reduce/reduce
 // ============================================================================
@@ -17,11 +19,12 @@
 
 namespace {
 
-// 每 block 线程数（各内核均要求为 2 的幂；v4 另要求 >= 64）。
+// 每 block 线程数（各内核均要求为 2 的幂；v4 另要求 >= 64）。reduce_v5 的
+// 显式实例化固定为 BLOCK_SIZE = 256（见 reduce.cuh/.cu），修改本值需同步。
 constexpr int kBlock = 256;
 
 // 被测内核表。elems_per_thread：每线程加载的输入元素数，决定“覆盖 n 所需的
-// grid”——v0/v1/v2 为 1，v3/v4 为 2（grid 减半），GridFor 据此计算。
+// grid”——v0/v1/v2 为 1，v3/v4/v5 为 2（grid 减半），GridFor 据此计算。
 struct KernelEntry {
   const char* name;           // 打印用名字
   ReduceKernel kernel;        // 内核函数指针
@@ -34,6 +37,7 @@ const KernelEntry kKernels[] = {
     {"reduce_v2 (折半步长)", reduce_v2, 1},
     {"reduce_v3 (每线程 2 元素)", reduce_v3, 2},
     {"reduce_v4 (每线程 2 元素 + warp 归约)", reduce_v4, 2},
+    {"reduce_v5 (常量 block + warp 归约)", reduce_v5<kBlock>, 2},
 };
 
 // 测试场景。label 仅用于打印；n 为输入元素个数；extra_grid 为在“恰好覆盖 n 的

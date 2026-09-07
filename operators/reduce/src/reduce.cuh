@@ -7,11 +7,12 @@
 // 两阶段归约约定：每 block 把负责的连续段归约为 1 个部分和，写入
 // output[blockIdx.x]（故 output 至少要有 grid 个元素）；最终标量由调用方对
 // output[0, grid) 再汇总一次。各版本均保持 ReduceKernel 签名与上述输出约定，
-// 使 test_reduce_kernel 能以函数指针统一驱动 v0…v4。
+// 使 test_reduce_kernel 能以函数指针统一驱动 v0…v5。
 //
 // GPU 内核版本演进（详细推导与实测结论见 operators/reduce/README.md）：
 //   v0 交错寻址 → v1 连续寻址 → v2 折半步长：共享内存树形归约逐档改进；
-//   v3/v4 在归约前加入“每线程 2 元素”展开，v4 再把归约尾部换为 warp 展开。
+//   v3/v4 在归约前加入“每线程 2 元素”展开，v4 再把归约尾部换为 warp 展开；
+//   v5 把 block 尺寸常量化（模板参数），让归约步骤在编译期整体展开。
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -56,6 +57,60 @@ __global__ void reduce_v3(const float* input, float* output, int n);
 //   加载与覆盖口径同 v3（grid = ceil(n / (2*blockDim.x))）；另要求 blockDim.x
 //   为 2 的幂且 >= 64（展开第一步需读取 smem[tid+32]）。
 __global__ void reduce_v4(const float* input, float* output, int n);
+
+// v5 v4 + 编译期常量化 block 尺寸：block 大小改由模板参数 BLOCK_SIZE 固定，
+//   归约各级 if (BLOCK_SIZE >= ...) 均为编译期常量条件，编译器只保留当前
+//   BLOCK_SIZE 需要的步骤并整体展开（无运行时归约循环，指令序列更短）。
+//   覆盖口径同 v3/v4：grid = ceil(n / (2*BLOCK_SIZE))；要求 BLOCK_SIZE 为
+//   2 的幂且 >= 64。模板定义必须内联在头文件：各实例化点（main.cu 等）据此
+//   自行生成 reduce_v5<kBlock> 的设备代码，避免 -rdc=false 下跨翻译单元引用
+//   __global__ 模板特化（nvcc 已对该用法发出弃用警告）。注册表取
+//   reduce_v5<256> 实例（与 main.cu 的 kBlock = 256 对应）作函数指针。
+template <int BLOCK_SIZE>
+__global__ void reduce_v5(const float* input, float* output, int n) {
+  extern __shared__ float smem[];
+
+  const int tid = threadIdx.x;
+  const int gid = blockIdx.x * (2 * BLOCK_SIZE) + threadIdx.x;
+
+  // 每线程预加和相距 BLOCK_SIZE 的两个元素（越界跳过，等价补 0）。
+  float val = 0.0f;
+  if (gid < n) val += input[gid];
+  if (gid + BLOCK_SIZE < n) val += input[gid + BLOCK_SIZE];
+  smem[tid] = val;
+  __syncthreads();
+
+  // 编译期常量归约级：每级把部分和数量折半、就地落回 smem 前端连续槽（无
+  // bank 冲突，同 v2 说明）；BLOCK_SIZE 已知使未命中的整级分支可被消除。
+  if (BLOCK_SIZE >= 512) {
+    if (tid < 256) smem[tid] += smem[tid + 256];  // 512 -> 256 个部分和
+    __syncthreads();
+  }
+  if (BLOCK_SIZE >= 256) {
+    if (tid < 128) smem[tid] += smem[tid + 128];  // 256 -> 128
+    __syncthreads();
+  }
+  if (BLOCK_SIZE >= 128) {
+    if (tid < 64) smem[tid] += smem[tid + 64];  // 128 -> 64
+    __syncthreads();
+  }
+
+  // 剩余 <= 64 个部分和收进 warp 0 展开合并（volatile 保证每次读写真实落内存，
+  // 免去其后所有 __syncthreads，语义与实现细节同 reduce.cu 的 warpReduce 注释）。
+  if (tid < 32) {
+    volatile float* vsmem = smem;
+    if (BLOCK_SIZE >= 64) vsmem[tid] += vsmem[tid + 32];  // 64 -> 32
+    vsmem[tid] += vsmem[tid + 16];
+    vsmem[tid] += vsmem[tid + 8];
+    vsmem[tid] += vsmem[tid + 4];
+    vsmem[tid] += vsmem[tid + 2];
+    vsmem[tid] += vsmem[tid + 1];
+  }
+
+  if (tid == 0) {
+    output[blockIdx.x] = smem[0];
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 归约内核统一签名
