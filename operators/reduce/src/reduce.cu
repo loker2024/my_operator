@@ -1,5 +1,5 @@
 // ============================================================================
-// reduce.cu —— reduce.cuh 声明的算子实现（CPU 参考 + GPU 内核 v0…v4）。
+// reduce.cu —— reduce.cuh 声明的算子实现（CPU 参考 + GPU 内核 v0…v4、v6）。
 // 接口契约、版本差异与启动约束见 reduce.cuh；详细推导与实测结论见
 // operators/reduce/README.md。此处只保留实现侧的必要说明。
 // reduce_v5 为模板内核，因实例化点需可见其定义，实现整体内联于 reduce.cuh。
@@ -189,7 +189,55 @@ __global__ void reduce_v4(const float* input, float* output, int n) {
 // v5 与 v4 算法一致，仅把 block 尺寸以模板参数常量化、让归约步骤在编译期
 // 整体展开；因 -rdc=false 下跨翻译单元引用 __global__ 模板特化已被 nvcc 弃用，
 // 其模板定义整体内联在 reduce.cuh 中（main.cu 以 reduce_v5<kBlock> 实例化）。
-// ============================================================================
-// 普通（非模板）内核实现到此为止；reduce_v5 见 reduce.cuh。测试执行入口与
-// 被测内核注册见 main.cu。
-// ============================================================================
+
+// ---------------------------------------------------------------------------
+// warpReduceSum —— 单 warp shuffle 归约（每 lane 1 个局部和 → 全 lane 同值）
+// ---------------------------------------------------------------------------
+// 5 轮 __shfl_down_sync（offset 16 → 1）在寄存器间归约，不碰共享内存、无需同步；
+// mask 0xffffffff 要求完整 warp 收敛调用，调用点不可只留单条 lane。
+__device__ float warpReduceSum(float val) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+// ---------------------------------------------------------------------------
+// reduce_v6 —— 每线程 2 元素 + 两级 warp shuffle 归约
+// ---------------------------------------------------------------------------
+// 加载与覆盖口径同 v3/v4/v5（每 block 覆盖 2*blockDim.x 个连续元素），仅把块内
+// 折半树归约换成 warp shuffle：warpReduceSum 先把每 warp 归为 1 个部分和（lane 0
+// 写入 warp_results[wid]），__syncthreads 后 warp 0 再归约 numWarps 个部分和。
+// 约束：blockDim.x 为 2 的幂且 32 <= blockDim.x <= 1024，部分和须装得进
+// warp_results[32]。
+__global__ void reduce_v6(const float* input, float* output, int n) {
+  __shared__ float warp_results[32];  // 各 warp 的部分和
+
+  const int tid = threadIdx.x;
+  const int gid = blockIdx.x * (2 * blockDim.x) + threadIdx.x;
+  const int lane = tid % 32;
+  const int wid = tid / 32;
+
+  float val = 0.0f;
+  if (gid < n) val += input[gid];
+  if (gid + blockDim.x < n) val += input[gid + blockDim.x];
+
+  val = warpReduceSum(val);  // ① warp 内归约
+  if (lane == 0) {
+    warp_results[wid] = val;
+  }
+
+  __syncthreads();
+
+  // ② 每 lane 取 1 个 warp 的部分和再归约一次（lane >= numWarps 视为 0）。
+  // shuffle 需整 warp 参与，故仍让整个 warp 0 执行。
+  const int numWarps = blockDim.x / 32;
+  if (wid == 0) {
+    val = (lane < numWarps) ? warp_results[lane] : 0.0f;
+    val = warpReduceSum(val);
+  }
+
+  if (tid == 0) {
+    output[blockIdx.x] = val;
+  }
+}

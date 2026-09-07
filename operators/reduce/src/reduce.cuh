@@ -7,12 +7,13 @@
 // 两阶段归约约定：每 block 把负责的连续段归约为 1 个部分和，写入
 // output[blockIdx.x]（故 output 至少要有 grid 个元素）；最终标量由调用方对
 // output[0, grid) 再汇总一次。各版本均保持 ReduceKernel 签名与上述输出约定，
-// 使 test_reduce_kernel 能以函数指针统一驱动 v0…v5。
+// 使 test_reduce_kernel 能以函数指针统一驱动 v0…v6。
 //
 // GPU 内核版本演进（详细推导与实测结论见 operators/reduce/README.md）：
 //   v0 交错寻址 → v1 连续寻址 → v2 折半步长：共享内存树形归约逐档改进；
 //   v3/v4 在归约前加入“每线程 2 元素”展开，v4 再把归约尾部换为 warp 展开；
-//   v5 把 block 尺寸常量化（模板参数），让归约步骤在编译期整体展开。
+//   v5 把 block 尺寸常量化（模板参数），让归约步骤在编译期整体展开；
+//   v6 块内归约改两级 warp shuffle（寄存器直传），块内只剩一次 __syncthreads。
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -111,6 +112,10 @@ __global__ void reduce_v5(const float* input, float* output, int n) {
     output[blockIdx.x] = smem[0];
   }
 }
+
+// v6 见 reduce.cu：两级 warp shuffle 归约版，覆盖口径同 v3/v4/v5，要求
+// blockDim.x 为 2 的幂且 32 <= blockDim.x <= 1024。
+__global__ void reduce_v6(const float* input, float* output, int n);
 
 // ---------------------------------------------------------------------------
 // 归约内核统一签名

@@ -7,9 +7,10 @@
 CompileFlags:
   Compiler: clang++
 
-  # Directory that contains compile_commands.json, or None when Nsight falls
-  # back to generic CUDA flags.
-  CompilationDatabase: None
+  # Directory that contains compile_commands.json. Pointing at CMake's build
+  # dir lets clangd recover the project include paths (e.g. common/include)
+  # that the generic fallback flags below do not cover.
+  CompilationDatabase: build
 
   Add:
     # CUDA Toolkit selected for this workspace. These paths are explicit because

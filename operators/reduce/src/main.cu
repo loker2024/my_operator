@@ -16,15 +16,17 @@
 
 #include "reduce.cuh"
 #include "test.cuh"
+#include "operator_common/cuda_check.h"
 
 namespace {
 
-// 每 block 线程数（各内核均要求为 2 的幂；v4 另要求 >= 64）。reduce_v5 的
-// 显式实例化固定为 BLOCK_SIZE = 256（见 reduce.cuh/.cu），修改本值需同步。
+// 每 block 线程数（各内核均要求为 2 的幂；v4/v5 另要求 >= 64，v6 要求 >= 32
+// 且 <= 1024）。reduce_v5 的显式实例化固定为 BLOCK_SIZE = 256（见 reduce.cuh/
+// .cu），修改本值需同步。
 constexpr int kBlock = 256;
 
 // 被测内核表。elems_per_thread：每线程加载的输入元素数，决定“覆盖 n 所需的
-// grid”——v0/v1/v2 为 1，v3/v4/v5 为 2（grid 减半），GridFor 据此计算。
+// grid”——v0/v1/v2 为 1，v3/v4/v5/v6 为 2（grid 减半），GridFor 据此计算。
 struct KernelEntry {
   const char* name;           // 打印用名字
   ReduceKernel kernel;        // 内核函数指针
@@ -38,6 +40,7 @@ const KernelEntry kKernels[] = {
     {"reduce_v3 (每线程 2 元素)", reduce_v3, 2},
     {"reduce_v4 (每线程 2 元素 + warp 归约)", reduce_v4, 2},
     {"reduce_v5 (常量 block + warp 归约)", reduce_v5<kBlock>, 2},
+    {"reduce_v6 (每线程 2 元素 + warp shuffle)", reduce_v6, 2},
 };
 
 // 测试场景。label 仅用于打印；n 为输入元素个数；extra_grid 为在“恰好覆盖 n 的
@@ -133,6 +136,9 @@ int main() {
   // 改为 true。
   constexpr bool kEnableBoundary = false;
   constexpr bool kStrictBenchmark = false;
+
+  PrintDeviceInfo();
+  std::printf("\n");
 
   std::printf("==== Reduce 测试：正确性(容差 1e-3) + 性能 ====\n");
   std::printf("block = %d；被测内核 %zu 个\n", kBlock,

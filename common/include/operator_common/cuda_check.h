@@ -30,4 +30,10 @@ inline void PrintDeviceInfo() {
   std::printf("  shared mem / block  : %zu bytes\n", prop.sharedMemPerBlock);
   std::printf("  global mem         : %.1f GB\n",
               prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+  // cudaDeviceProp 无带宽字段；按显存时钟(kHz) × 2(双沿) × 位宽/8 估算理论峰值。
+  // 实际可达带宽需跑 benchmark（如 bandwidthTest / cudaMemcpy D2D 测速）。
+  std::printf("  mem clock          : %d kHz\n", prop.memoryClockRate);
+  std::printf("  mem bus width      : %d bit\n", prop.memoryBusWidth);
+  std::printf("  peak bandwidth(GB/s): %.1f\n",
+              2.0 * prop.memoryClockRate * (prop.memoryBusWidth / 8.0) / 1e6);
 }
