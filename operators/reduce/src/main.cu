@@ -20,13 +20,15 @@
 
 namespace {
 
-// 每 block 线程数（各内核均要求为 2 的幂；v4/v5 另要求 >= 64，v6 要求 >= 32
+// 每 block 线程数（各内核均要求为 2 的幂；v4/v5 另要求 >= 64，v6/v7 要求 >= 32
 // 且 <= 1024）。reduce_v5 的显式实例化固定为 BLOCK_SIZE = 256（见 reduce.cuh/
 // .cu），修改本值需同步。
 constexpr int kBlock = 256;
 
 // 被测内核表。elems_per_thread：每线程加载的输入元素数，决定“覆盖 n 所需的
-// grid”——v0/v1/v2 为 1，v3/v4/v5/v6 为 2（grid 减半），GridFor 据此计算。
+// grid”——v0/v1/v2 为 1，v3/v4/v5/v6 为 2（grid 减半），v7 为 4（float4 向量化，
+// grid 再减半），GridFor 据此计算。v7 为 grid-stride 扫描，任意 grid >= 1 都完整
+// 覆盖输入，该值只用于给出“多数线程单轮完成”的推荐网格。
 struct KernelEntry {
   const char* name;           // 打印用名字
   ReduceKernel kernel;        // 内核函数指针
@@ -41,6 +43,7 @@ const KernelEntry kKernels[] = {
     {"reduce_v4 (每线程 2 元素 + warp 归约)", reduce_v4, 2},
     {"reduce_v5 (常量 block + warp 归约)", reduce_v5<kBlock>, 2},
     {"reduce_v6 (每线程 2 元素 + warp shuffle)", reduce_v6, 2},
+    {"reduce_v7 (float4 向量化 + warp shuffle)", reduce_v7, 4},
 };
 
 // 测试场景。label 仅用于打印；n 为输入元素个数；extra_grid 为在“恰好覆盖 n 的
@@ -60,6 +63,8 @@ constexpr size_t CountOf(const Scenario (&)[N]) {
 //   base = ceil(n / (block * elems_per_thread))，每 block 覆盖
 //   block * elems_per_thread 个连续元素；n == 0 时 base 至少为 1；
 //   再叠加 extra_grid 个冗余 block。
+// 对 v7（grid-stride 扫描）该值为“推荐网格”而非“精确覆盖所需”：其循环按
+// gridDim 联合步进，grid >= 1 即完整覆盖，超出部分只空转（写 0），仍安全。
 int GridFor(int n, int block, int elems_per_thread, int extra_grid) {
   const int span = block * elems_per_thread;
   int base = (n + span - 1) / span;
@@ -75,12 +80,15 @@ const Scenario kNormalScenarios[] = {
 
 // 场景组 B：边界条件 —— 极小规模与 block 边界附近 / 整 block 满载的形状，
 // 覆盖补 0、单 block、双 block（第二个 block 只有少量有效元素）等路径。
+// 对 v7 额外补足 n % 4 尾部余数的向量化路径（余 2 的形状，配合 kBlock±1 的余
+// 1 / 余 3 与 kBlock 的整除，覆盖 float4 主循环 + 标量尾部的全部组合）。
 const Scenario kBoundaryScenarios[] = {
     {"边界: n=1, 单元素", 1, 0},
     {"边界: n=block, 恰 1 个 block 满载", kBlock, 0},
     {"边界: n=block-1, 差 1 满载", kBlock - 1, 0},
     {"边界: n=block+1, 需 2 个 block", kBlock + 1, 0},
     {"边界: n=2*block-1, 第 2 个 block 仅 1 个有效元素", 2 * kBlock - 1, 0},
+    {"边界: n=block-2, float4 尾部余 2 元素", kBlock - 2, 0},
 };
 
 // 场景组 C：异常 / 健壮性 —— 空输入、超配 grid。

@@ -27,7 +27,7 @@ out[i] = Σ_j x[i, j]  // 行求和（row-sum），输入 rows×cols，输出长
 | CUDA | v4 | 每线程 2 元素 + 末 warp 展开：折半归约停在 32 个部分和，由 warp 0 以 volatile 共享内存逐位展开收尾（省去剩余 5 轮 `__syncthreads`） | 完成（已接入测试） |
 | CUDA | v5 | v4 + 编译期常量化 block 尺寸（模板 `BLOCK_SIZE`）：各级折半阈值全为编译期常量，归约步骤整体展开、无运行时归约循环；覆盖口径同 v3/v4 | 完成（已接入测试） |
 | CUDA | v6 | 每线程 2 元素 + 两级 warp shuffle 归约：块内折半树整体换成寄存器 shuffle，只剩一次 `__syncthreads`（要求 block 为 2 的幂且 32~1024）；覆盖口径同 v3/v4/v5 | 完成（已接入测试） |
-| CUDA | v7 | v6 + `float4` 向量化加载（需对齐约束与尾列处理） | 规划中 |
+| CUDA | v7 | v6 + `float4` 向量化加载与 grid-stride 扫描（input 需 16 字节对齐，`n%4` 尾部标量补齐） | 完成（已接入测试） |
 | CUDA | vx | 扩展形态：行/列/全局归约、一个 block 处理多行以摊薄调度 | 规划中 |
 | Triton | t0/t1 | 与 CUDA 同规格的 Triton 实现并做性能对照 | 规划中 |
 
@@ -73,8 +73,14 @@ out[i] = Σ_j x[i, j]  // 行求和（row-sum），输入 rows×cols，输出长
   部分和，由 lane 0 写入 `warp_results[wid]`，`__syncthreads` 后 warp 0 再对
   `numWarps` 个部分和归约一次，块内只剩一次同步（要求 block 为 2 的幂且
   `32 <= block <= 1024`）。已注册进被测内核表。
-- **v7 float4 向量化（规划中）**：在 v6 的 warp shuffle 之上用 `float4` 连续加载
-  （需对齐约束与尾列处理），减少指令与访存事务。
+- **v7 float4 向量化 + grid-stride（本轮完成）**：加载与覆盖口径和 v0…v6 不同——
+  全体线程以 `gridDim.x * blockDim.x` 为步长联合扫描 `float4` 序列（input 需
+  16 字节对齐，`cudaMalloc` 分配天然满足），每轮读 1 个 `float4` 做 4 分量寄存器
+  累加，把全局加载指令与访存事务降为标量加载的约 1/4；`n % 4` 尾部元素由第二个
+  grid-stride 循环标量补齐。块内归约沿用 v6 的两级 warp shuffle，块内仍只有一次
+  `__syncthreads`。因 grid-stride 对任意 `grid >= 1` 都完整覆盖输入，启动网格不再
+  要求严格配比（推荐 `ceil(n/(4*block))` 使多数线程单轮读完，超配 block 只空转并
+  写 0，仍满足“超配安全”）。已注册进被测内核表。
 - 两阶段归约约定：每个 block 只产出 1 个部分和到 `output[blockIdx.x]`，最终
   标量由调用方对 `output[0, grid)` 做一次轻量求和。该约定保证了各版本签名
   完全一致（`ReduceKernel`），从而可被同一套测试驱动复用。
@@ -82,7 +88,8 @@ out[i] = Σ_j x[i, j]  // 行求和（row-sum），输入 rows×cols，输出长
 ## 参考规模
 
 - 默认：`n = 2^20`（fp32，约 4 MiB 输入；v0/v1/v2 的 `grid = n/block = 4096`，
-  v3/v4/v5/v6 每线程 2 元素 → `grid = n/(2*block) = 2048`）。
+  v3/v4/v5/v6 每线程 2 元素 → `grid = n/(2*block) = 2048`，v7 每线程 1 个 float4 →
+  `grid = n/(4*block) = 1024`）。
 - 可选：`n = 2^20 + 1000`（尾部非对齐，覆盖越界补 0 路径）等边界形状见
   `src/main.cu` 的场景表。
 - block 大小默认 256。
@@ -93,20 +100,21 @@ out[i] = Σ_j x[i, j]  // 行求和（row-sum），输入 rows×cols，输出长
 reduce/
 ├── README.md   # 本文档：规划 + 结论总表
 ├── CMakeLists.txt  # 构建脚本（src/main.cu 存在即自动启用）
-└── src/        # CUDA 实现（普通内核 v0…v4、v6 在 reduce.cu；模板内核 v5 内联于 reduce.cuh）
+└── src/        # CUDA 实现（普通内核 v0…v4、v6、v7 在 reduce.cu；模板内核 v5 内联于 reduce.cuh）
     ├── reduce.cuh / reduce.cu   # 算子接口与实现（被测试对象）
     ├── test.cuh  / test.cu      # 可复用测试驱动：正确性(容差1e-3)+性能
-    └── main.cu                  # 执行入口：注册 v0…v6，运行测试
+    └── main.cu                  # 执行入口：注册 v0…v7，运行测试
 ```
 
 > 注：`triton/`（第二阶段 Triton 实现）与 `notes/`（学习笔记）属规划目录，尚未创建。
 
-测试入口 `src/main.cu` 将 `reduce_v0` … `reduce_v6` 注册给同一测试驱动，
-覆盖三类场景（每组场景七个内核各跑一遍）：
+测试入口 `src/main.cu` 将 `reduce_v0` … `reduce_v7` 注册给同一测试驱动，
+覆盖三类场景（每组场景八个内核各跑一遍）：
 
 - **正常流程**：大规模对齐（`n=2^20`）、尾部非对齐（`n=2^20+1000`）；
 - **边界条件**：`n=1` 单元素、`n=block` 恰一个 block 满载、`n=block-1`、
-  `n=block+1`、`n=2*block-1`（末 block 仅 1 个有效元素）；
+  `n=block+1`、`n=2*block-1`（末 block 仅 1 个有效元素）；另含 `n=block-2`，
+  与上述形状共同覆盖 `n % 4` 整除 / 余 1 / 余 2 / 余 3 的 v7 尾部路径；
 - **异常 / 健壮性**：`n=0` 空输入（期望和 = 0）、grid 超配 +3 个冗余 block
   （多余 block 全补 0、不影响结果）、非法参数（`n<0` / `grid<1` 判 FAIL）。
 
@@ -114,7 +122,7 @@ reduce/
 
 | 开关 | 默认 | 作用 |
 | --- | --- | --- |
-| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时只跑正常流程（14 项），开启后为全量回归（63 项） |
+| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时只跑正常流程（16 项），开启后为全量回归（80 项） |
 | `strict_benchmark` | `false` | 是否按严格口径采样（透传给 `test_reduce_kernel` 的同名参数）：关闭时 1 次预热 + 100 次迭代；开启时 1000 次预热 + 21 组 × 10000 次并输出 P5/P95 |
 
 日常开发保持默认即可（只跑有性能意义的大规模形状）；出严格基准数字或做全量
@@ -163,3 +171,5 @@ cmake --build build --target reduce
 | v5 常量 block+warp | n=2^20+1000 | 0.0176 | 238.68 | 0.000e+00 | 尾部形状未复现对齐增益，落在噪声带内（P5/P95 0.0145/0.0211） |
 | v6 warp shuffle | n=2^20 (对齐) | 0.0124 | 339.68 | 0.000e+00 | 同场 v4/v5 复测 310.89 / 331.46 → 约 +2.5%；warp shuffle 收益收窄，瓶颈已转向全局访存 |
 | v6 warp shuffle | n=2^20+1000 | 0.0126 | 335.04 | 0.000e+00 | 尾部非对齐略降，落在噪声带内（P5/P95 0.0121/0.0144） |
+| v7 float4+grid-stride | n=2^20 (对齐) | 0.0102 | 412.16 | 0.000e+00 | 同场 v5/v6 复测 329.99/341.39 → 相对 v6 约 +20.7% |
+| v7 float4+grid-stride | n=2^20+1000 | 0.0110 | 381.35 | 0.000e+00 | 同场 v5/v6 复测 331.34/337.98 → 相对 v6 约 +12.8%（P5/P95 0.0097/0.0119） |

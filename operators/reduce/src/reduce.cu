@@ -1,5 +1,5 @@
 // ============================================================================
-// reduce.cu —— reduce.cuh 声明的算子实现（CPU 参考 + GPU 内核 v0…v4、v6）。
+// reduce.cu —— reduce.cuh 声明的算子实现（CPU 参考 + GPU 内核 v0…v4、v6、v7）。
 // 接口契约、版本差异与启动约束见 reduce.cuh；详细推导与实测结论见
 // operators/reduce/README.md。此处只保留实现侧的必要说明。
 // reduce_v5 为模板内核，因实例化点需可见其定义，实现整体内联于 reduce.cuh。
@@ -231,6 +231,65 @@ __global__ void reduce_v6(const float* input, float* output, int n) {
 
   // ② 每 lane 取 1 个 warp 的部分和再归约一次（lane >= numWarps 视为 0）。
   // shuffle 需整 warp 参与，故仍让整个 warp 0 执行。
+  const int numWarps = blockDim.x / 32;
+  if (wid == 0) {
+    val = (lane < numWarps) ? warp_results[lane] : 0.0f;
+    val = warpReduceSum(val);
+  }
+
+  if (tid == 0) {
+    output[blockIdx.x] = val;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// reduce_v7 —— float4 向量化加载 + grid-stride 扫描 + 两级 warp shuffle
+// ---------------------------------------------------------------------------
+// 加载阶段与 v0…v6“每 block 分块连续覆盖”不同：v7 改为 grid-stride 扫描，全体
+// 线程以 total = gridDim.x * blockDim.x 为步长遍历 float4 序列，每轮读入 1 个
+// float4（16 B，input 需 16 字节对齐，cudaMalloc 分配天然满足）并做 4 分量寄存器
+// 累加，全局加载指令数与访存事务约为标量加载的 1/4。n 不是 4 的倍数时，末尾
+// [n4*4, n) 至多 3 个元素由第二个 grid-stride 循环以标量方式补齐。grid-stride
+// 覆盖不依赖 grid 精确配比（任意 grid >= 1 均完整覆盖，冗余 block 不读数据、写
+// 0），为单轮完成推荐的启动网格为 ceil(n / (4*blockDim.x))。
+//
+// 块内归约沿用 v6 的两级 warp shuffle：warpReduceSum 先把每 warp 归为 1 个部分和
+// （lane 0 写入 warp_results[wid]），__syncthreads 后 warp 0 再归约 numWarps 个
+// 部分和。约束同 v6：blockDim.x 为 2 的幂且 32 <= blockDim.x <= 1024。
+__global__ void reduce_v7(const float* input, float* output, int n) {
+  const int tid = threadIdx.x;
+  const int lane = tid % 32;
+  const int wid = tid / 32;
+
+  // float4 主循环：input 整体视作 n/4 个 float4（要求 16 字节对齐）。
+  const float4* input4 = reinterpret_cast<const float4*>(input);
+  const int n4 = n / 4;
+
+  float val = 0.0f;
+  for (int idx = blockIdx.x * blockDim.x + tid; idx < n4;
+       idx += gridDim.x * blockDim.x) {
+    const float4 data = input4[idx];
+    val += data.x + data.y + data.z + data.w;
+  }
+
+  // 尾部标量循环：覆盖 [n4*4, n)，grid-stride 步长与主循环一致。
+  const int tail_start = n4 * 4;
+  for (int idx = tail_start + blockIdx.x * blockDim.x + tid; idx < n;
+       idx += gridDim.x * blockDim.x) {
+    val += input[idx];
+  }
+
+  // ① warp 内归约
+  val = warpReduceSum(val);
+
+  __shared__ float warp_results[32];  // 各 warp 的部分和
+  if (lane == 0) {
+    warp_results[wid] = val;
+  }
+
+  __syncthreads();
+
+  // ② warp 0 归约 numWarps 个部分和（lane >= numWarps 视为 0）。
   const int numWarps = blockDim.x / 32;
   if (wid == 0) {
     val = (lane < numWarps) ? warp_results[lane] : 0.0f;

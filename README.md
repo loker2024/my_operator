@@ -16,7 +16,7 @@
 | Softmax | fp32，行主序、逐行归一化 | 规划中 | 规划中 | `operators/softmax` |
 | GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 规划中 | 规划中 | `operators/gemm` |
 | Attention | 单头、fp32、无 mask | 规划中 | 规划中 | `operators/attention` |
-| Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 进行中（v0…v6） | 规划中 | `operators/reduce` |
+| Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 进行中（v0…v7） | 规划中 | `operators/reduce` |
 
 状态说明：
 
