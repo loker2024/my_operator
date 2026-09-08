@@ -16,7 +16,7 @@
 | Softmax | fp32，行主序、逐行归一化 | 规划中 | 规划中 | `operators/softmax` |
 | GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 规划中 | 规划中 | `operators/gemm` |
 | Attention | 单头、fp32、无 mask | 规划中 | 规划中 | `operators/attention` |
-| Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 进行中（v0…v7） | 规划中 | `operators/reduce` |
+| Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 完成（v0…v7） | 规划中 | `operators/reduce` |
 
 状态说明：
 
@@ -34,13 +34,17 @@ my_operator/
 │       ├── CpuTimer.h          # CPU 计时（std::chrono）
 │       └── GpuTimer.h          # CUDA 事件计时
 ├── operators/
-│   ├── softmax/                # Softmax：CUDA → Triton
+│   ├── softmax/                # Softmax：CUDA → Triton（骨架，src/ 尚未创建）
 │   │   ├── README.md           # 规划与结论
-│   │   ├── CMakeLists.txt      # 出现 src/main.cu 后自动启用（三个算子同构）
-│   │   └── src/                # CUDA 源码（由你实现），src/main.cu 为入口
-│   ├── gemm/                   # SGEMM：CUDA → Triton（结构同 softmax）
-│   ├── attention/              # Attention：CUDA → Triton（结构同 softmax）
-│   └── reduce/                 # Reduce：CUDA → Triton（结构同 softmax）
+│   │   └── CMakeLists.txt      # 出现 src/main.cu 后自动启用（各算子同一约定）
+│   ├── gemm/                   # SGEMM：CUDA → Triton（骨架，结构同 softmax）
+│   ├── attention/              # Attention：CUDA → Triton（骨架，结构同 softmax）
+│   └── reduce/                 # Reduce：CUDA 核心版 v0…v7 已实现（当前唯一启用目标）
+│       ├── README.md           # 规划 + 状态 + 结论记录
+│       ├── notes/
+│       │   └── reduce.md       # v0→v7 算法推导与优化讲解（学习文档）
+│       ├── CMakeLists.txt
+│       └── src/                # CUDA 实现：reduce.cuh/.cu、test.cuh/.cu、main.cu
 ├── docs/
 │   └── benchmark-methodology.md # 正确性验证与性能基准的统一口径
 ├── demo/                       # 独立 CUDA 学习示例（不接入顶层 CMake）
@@ -74,9 +78,9 @@ operators/<name>/
 # 1. 创建源码，例如 operators/softmax/src/main.cu（及其它 .cu/.cuh）
 # 2. 重新 configure（新增/删除文件后必须重新执行）
 cmake --preset release
-# 3. 构建并运行
-cmake --build build --target softmax   # 目标名 = 算子目录名
-./build/operators/softmax/softmax
+# 3. 构建并运行（当前仅 reduce 已创建 src/main.cu，其余算子目标自动跳过）
+cmake --build build --target reduce   # 目标名 = 算子目录名
+./build/operators/reduce/reduce
 ```
 
 运行该可执行文件即执行该算子的「正确性验证 + 性能基准」，打印通过/失败与耗时统计（失败时返回非零退出码，便于脚本化）。
@@ -106,8 +110,8 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
 - [ ] Softmax：CUDA 核心版本（v0 → 优化变体）
 - [ ] GEMM：CUDA 核心版本（v0 → 优化变体）
 - [ ] Attention：CUDA 核心版本（v0 → Flash 风格）
-- [x] Reduce：CUDA 核心版本（v0 → v7 优化变体）   <!-- 全量回归为 8 个内核 × 10 个场景 = 80 项；默认仅跑 2 个正常场景，即 16 项。 -->
-- [ ] 各算子正确性验证与基准记录
+- [x] Reduce：CUDA 核心版本（v0 → v7 优化变体）与验证 / 基准记录   <!-- 全量回归为 8 个内核 × 10 个场景 = 80 项；默认仅跑 2 个正常场景，即 16 项；严格基准结论见 operators/reduce/README.md「结论记录」。 -->
+- [ ] Softmax / GEMM / Attention：CUDA 核心版本 → 正确性验证与基准记录
 - [ ] 逐个补充 Triton 版本，与 CUDA 对齐并对照性能
 
 ## 许可证

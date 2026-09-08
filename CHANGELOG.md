@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- 2026-09-08 13:31 根 `README.md` 文档同步（事实校正）：Reduce 的 CUDA 核心版状态由「进行中（v0…v7）」改为「完成（v0…v7）」；目录结构树按仓库实际拆分 reduce（含 `notes/reduce.md`、`src/`），并标明 softmax / gemm / attention 为 src/ 尚未创建的骨架；构建示例目标由未启用的 softmax 改为当前唯一启用的 reduce；路线图勾选 Reduce 的验证 / 基准记录，收窄剩余项为 Softmax / GEMM / Attention。
 - 2026-09-08 文档与注释同步：根 README 更新 Reduce 的 v0…v7 与 80 项全量回归状态，补充未接入 CMake 的 `demo/` 说明；基准方法改为反映 Reduce 实际使用的确定性 `i % 1000` 输入；修正 `main.cu` 中 reduce_v5 模板实例化位置的过时说明。
 
 ### Added
