@@ -13,25 +13,27 @@
 #include "test.cuh"
 
 bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows,
-                         int cols, int block, bool strict_benchmark) {
-  // 迭代口径：开发（默认）vs 严格两档（见 docs/benchmark-methodology.md；
-  // softmax 单次内核开销远大于 reduce，严格档迭代数折半为 2000）。
+                         int cols, int grid, int block, std::size_t smem_bytes,
+                         bool strict_benchmark) {
+  // 迭代口径：开发（默认）vs 严格两档，与 reduce 测试文件一致
+  //（见 docs/benchmark-methodology.md）。
   const int warmup_iterations = strict_benchmark ? 1000 : 1;
-  const int iterations = strict_benchmark ? 2000 : 100;
+  const int iterations = strict_benchmark ? 10000 : 100;
   const int sample_count = strict_benchmark ? 21 : 1;
 
-  // 契约防御：非法参数判 FAIL 而非崩溃（rows/cols < 0 无意义，cudaMalloc(0) 未定义）。
-  if (rows < 0 || cols < 0 || block < 1) {
-    std::printf("[%s] 非法参数: rows=%d, cols=%d, block=%d (契约: rows>=0, "
-                "cols>=0, block>=1)  ->  FAIL\n",
-                kernel_name, rows, cols, block);
+  // 契约防御：非法参数判 FAIL 而非崩溃（rows/cols < 0 无意义，cudaMalloc(0)
+  // 未定义，grid/block < 1 无法启动）。
+  if (rows < 0 || cols < 0 || grid < 1 || block < 1) {
+    std::printf("[%s] 非法参数: rows=%d, cols=%d, grid=%d, block=%d "
+                "(契约: rows>=0, cols>=0, grid>=1, block>=1)  ->  FAIL\n",
+                kernel_name, rows, cols, grid, block);
     return false;
   }
 
-  // 元素总数与启动网格：grid = rows（每 block 处理一行）；空矩阵 rows == 0 时也
-  // 须 grid >= 1，内核由 row >= rows 越界判定空转。
+  // 元素总数。启动网格按被测内核的行映射由调用方给出（见 softmax.cuh）：v0
+  // 线程铺满行号、v1 每行一个 block；空矩阵 rows == 0 时 grid 也须 >= 1，内核
+  // 由 row >= rows 越界判定空转。
   const std::int64_t count = static_cast<std::int64_t>(rows) * cols;
-  const int grid = rows > 0 ? rows : 1;
 
   // 输入取确定性伪随机（行/列相关），范围 [-10, 10)：可复现，且不会让 exp 溢出
   // / 下溢；max-shift 后 exp 参数 <= 0 恒成立，行和 >= 1（含 exp(0) 项），避免
@@ -60,11 +62,10 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
   }
 
   // 只有 cudaLaunchKernel 才能以“运行期内核函数指针”启动，从而一份驱动复用所有
-  // 版本；args 中需放与形参 const 修饰严格匹配的指针。共享内存 = block 个 float，
-  // 供 v0 的树形规约存中间量。
+  // 版本；args 中需放与形参 const 修饰严格匹配的指针。grid/block/smem_bytes 按
+  // 被测内核的映射给出（v0 无共享内存 smem_bytes = 0；v1 为 blockDim.x 个 float）。
   const dim3 grid_dim(grid);
   const dim3 block_dim(block);
-  const size_t smem_bytes = static_cast<std::size_t>(block) * sizeof(float);
   const float* d_input_arg = d_input;
   float* d_output_arg = d_output;
   int rows_arg = rows;
@@ -100,8 +101,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
   const float p95_ms = sorted_ms[(sample_count - 1) * 95 / 100];
 
   // 有效带宽 =（输入读 rows*cols 个 float + 输出写 rows*cols 个 float）/ 中位耗时
-  // （逻辑数据量，每元素计 1 读 1 写；v0 内部实际多次读行导致的低效会直接反映为
-  // 更低的“有效带宽”，见 README）。
+  //（逻辑数据量，每元素计 1 读 1 写；v0/v1 内部实际多次读行、访问模式各异，
+  // 低效会直接反映为更低的“有效带宽”，见 README）。
   const double bytes_per_run = 2.0 * static_cast<double>(count) * sizeof(float);
   const double bandwidth_gbps = bytes_per_run / (median_ms * 1e6);
 

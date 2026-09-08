@@ -1,106 +1,113 @@
-// ============================================================================
-// softmax.cu —— softmax.cuh 声明的算子实现（CPU 参考 + GPU 内核 v0）。
-// 接口契约、版本差异与启动约束见 softmax.cuh；详细推导与实测结论见
-// operators/softmax/README.md。此处只保留实现侧的必要说明。
-// ============================================================================
+// softmax.cu —— softmax.cuh 声明的实现：CPU 参考 + softmax_v0/v1 内核。
+// 接口契约 / 启动约束 / 版本差异见 softmax.cuh，推导与实测见 README.md。
 
 #include <cmath>    // expf / fmaxf / INFINITY / std::exp
 #include <cstddef>  // std::size_t
 
 #include "softmax.cuh"
 
-// ---------------------------------------------------------------------------
-// softmax_cpu —— 主机端参考实现
-// ---------------------------------------------------------------------------
-// 逐行按 softmax 公式实现：先求行最大值 m，再以 (x - m) 求 Σexp，最后归一化。
-// 全程用 double：参考值不自带 fp32 舍入误差（GPU 侧还要经受 ≤1e-5 的相对误差
-// 判据，参考再引入误差会吃掉容差）；返回前转回 float 便于同类型比较。
-void softmax_cpu(const float* input, float* output, int rows, int cols) {
-  for (int r = 0; r < rows; ++r) {
-    const float* x = input + static_cast<std::size_t>(r) * cols;
-    float* y = output + static_cast<std::size_t>(r) * cols;
-    if (cols <= 0) continue;  // 空行：无元素可写
+// softmax_cpu —— 主机端参考（测试的正确性基线）
+void softmax_cpu(const float* input, float* output, int M, int N) {
+  // 逐行 softmax：求行最大 m → Σexp(x-m) → 归一化。全程 double：参考值不自带
+  // fp32 舍入误差（GPU 侧还要经受 1e-5 判据），返回前转回 float。
+  for (int row = 0; row < M; ++row) {
+    const float* x = input + static_cast<std::size_t>(row) * N;
+    float* y = output + static_cast<std::size_t>(row) * N;
+    if (N <= 0) continue;  // 空行：无元素可写
 
     double m = -INFINITY;
-    for (int c = 0; c < cols; ++c) {
+    for (int c = 0; c < N; ++c) {
       m = (static_cast<double>(x[c]) > m) ? static_cast<double>(x[c]) : m;
     }
 
     double sum = 0.0;
-    for (int c = 0; c < cols; ++c) {
+    for (int c = 0; c < N; ++c) {
       sum += std::exp(static_cast<double>(x[c]) - m);
     }
 
     const double inv_sum = 1.0 / sum;
-    for (int c = 0; c < cols; ++c) {
+    for (int c = 0; c < N; ++c) {
       y[c] = static_cast<float>(std::exp(static_cast<double>(x[c]) - m) * inv_sum);
     }
   }
 }
 
-// ---------------------------------------------------------------------------
-// softmax_v0 —— 朴素两遍规约（正确性基线）
-// ---------------------------------------------------------------------------
-// 每 block 处理一行（grid = rows）：线程 tid 以 stride = blockDim.x 步进整行，
-// warp 内各线程同一轮访问相邻列 → 全局读合并。共享内存只存规约中间量：
-//   ① 每线程维护局部最大，写 smem 后按 reduce_v2 的折半形态做 fmaxf 树形归约
-//     收敛到 smem[0]，得到行最大 m；
-//   ② 以 expf(x - m) 累加局部行和，同样的树形加法归约出 Σexp；
-//   ③ 每线程再读行、算 expf(x - m) / 行和写回 y。
-// 折半归约每轮后必须 __syncthreads（下轮读本轮刚写入的局部和）；①→② 复用同一
-// 段 smem 前也要先同步，保证所有线程都已读走 m。局部和/树形归约把 Σexp 的
-// fp32 舍入误差压在 ~(块内每线程元素数 + log2(block)) · ulp 量级，满足 1e-5
-// 的容差口径（逐元素、串行 4096 项累加会超差，故不做单线程整行归约）。
-__global__ void softmax_v0(const float* input, float* output, int rows,
-                           int cols) {
-  if (cols <= 0) return;  // 空行防御：避免 0 元素时的除零 / 空转
-  const int row = blockIdx.x;
-  if (row >= rows) return;  // 空矩阵 / 超配 grid 防御
+// softmax_v0 —— 每线程处理一行，行内串行三遍（正确性基线）
+__global__ void softmax_v0(const float* input, float* output, const int M,
+                           const int N) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;  // 线程铺满行号
+  if (row >= M) return;  // 空矩阵 / 超配 grid：越界行空转
 
-  extern __shared__ float smem[];  // 动态共享内存：blockDim.x * sizeof(float)
-  const int tid = threadIdx.x;
-  const int nthreads = blockDim.x;
-  const float* x = input + static_cast<std::size_t>(row) * cols;
-  float* y = output + static_cast<std::size_t>(row) * cols;
+  const float* x = input + row * N;
+  float* y = output + row * N;
 
-  // ① 行最大 m：strided 遍历求局部最大 → 共享内存树形 fmaxf 归约。
-  float local_max = -INFINITY;
-  for (int col = tid; col < cols; col += nthreads) {
-    local_max = fmaxf(local_max, x[col]);
+  // ① 行最大 m（max-shift 使 exp 参数 <= 0、行和 >= 1，数值稳定）
+  float max_val = -INFINITY;
+  for (size_t i = 0; i < N; ++i) {
+    max_val = fmaxf(max_val, x[i]);
   }
 
+  // ② Σexp(x - m)
+  float sum = 0.0f;
+  for (size_t i = 0; i < N; ++i) {
+    sum += expf(x[i] - max_val);
+  }
+
+  // ③ 归一化写回 y = exp(x - m) / 行和
+  const float inv_sum = 1.0f / sum;
+  for (size_t i = 0; i < N; ++i) {
+    y[i] = expf(x[i] - max_val) * inv_sum;
+  }
+}
+
+// softmax_v1 —— 每行一个 block，行内协作 + 共享内存树形归约
+__global__ void softmax_v1(const float* input, float* output, const int M,
+                           const int N) {
+  extern __shared__ float smem[];  // 动态共享内存：blockDim.x * sizeof(float)
+
+  const int row = blockIdx.x;  // 每 block 处理一行
+  const int tid = threadIdx.x;
+  if (row >= M) return;  // 空矩阵 / 超配 grid：空转
+
+  const float* x = input + row * N;
+  float* y = output + row * N;
+
+  // ① 各线程 stride 扫行求局部最大 → 折半 fmaxf 树形归约出行最大（warp 内
+  //    同轮访问相邻列 → 读合并；N 不整除 blockDim.x 时多余线程以 -inf 空转）
+  float local_max = -INFINITY;
+  for (int i = tid; i < N; i += blockDim.x) {
+    local_max = fmaxf(local_max, x[i]);
+  }
   smem[tid] = local_max;
   __syncthreads();  // 槽位全部就绪后才能开始归约
-  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (tid < stride) {
       smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
     }
     __syncthreads();  // 下一轮读本轮刚写入的局部最大
   }
   const float row_max = smem[0];
-  __syncthreads();  // 所有线程读走 m 后，smem 才能被第②阶段复用
+  __syncthreads();  // 全部线程读走 m 后，smem 才能被 ② 复用
 
-  // ② Σexp(x - m)：以 m 减平移（数值稳定），strided 累加 → 同样的树形归约。
+  // ② 同样的 stride 扫行累加局部 Σexp → 树形加法归约出行和（块内分段累加把
+  //    v0 整行串行的舍入误差降到 ~(每线程元素数 + log2(blockDim)) · ulp 量级）
   float local_sum = 0.0f;
-  for (int col = tid; col < cols; col += nthreads) {
-    local_sum += expf(x[col] - row_max);
+  for (int i = tid; i < N; i += blockDim.x) {
+    local_sum += expf(x[i] - row_max);
   }
-
   smem[tid] = local_sum;
   __syncthreads();
-  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (tid < stride) {
       smem[tid] += smem[tid + stride];
     }
     __syncthreads();
   }
   const float row_sum = smem[0];
-  __syncthreads();
 
-  // ③ 归一化写回：再读一次行以重算 exp（省去用 smem 存整行；行宽大时 smem
-  // 只装规约中间量，不受行宽限制）。exp(0) = 1 使行和 >= 1，不会除零。
+  // ③ 再读一次行重算 exp 并归一化写回（行宽任意，smem 无需装整行）
   const float inv_sum = 1.0f / row_sum;
-  for (int col = tid; col < cols; col += nthreads) {
-    y[col] = expf(x[col] - row_max) * inv_sum;
+  for (int i = tid; i < N; i += blockDim.x) {
+    y[i] = expf(x[i] - row_max) * inv_sum;
   }
 }

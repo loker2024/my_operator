@@ -1,25 +1,19 @@
 #pragma once
 // ============================================================================
 // softmax.cuh —— Softmax 算子接口声明（行主序 fp32 矩阵，逐行数值稳定 softmax）
-//   实现见同目录 softmax.cu；可复用测试驱动见 test.cuh / test.cu，
-//   测试执行入口见 main.cu。
+//   实现见同目录 softmax.cu；可复用测试驱动见 test.cuh/test.cu；执行入口见
+//   main.cu。推导与实测结论见 operators/softmax/README.md。
 //
 // 数学定义（每行独立归一化）：
-//   m_i  = max_j x[i,j]                      行最大值（max-shift，数值稳定用）
+//   m_i    = max_j x[i,j]                    行最大值（max-shift，数值稳定用）
 //   y[i,j] = exp(x[i,j] - m_i) / Σ_k exp(x[i,k] - m_i)
-//   先减行最大值使所有 exp 参数 <= 0：e^0 = 1 保证行和 >= 1，且不会上溢；
-//   减法只平移指数，softmax 结果不变，是大动态范围输入下标准的稳定写法。
+//   先减行最大使 exp 参数 <= 0：e^0 = 1 保证行和 >= 1、不会上溢，是大动态范围
+//   输入下标准的稳定写法（减常数不改变 softmax 结果）。
 //
-// 并行分解约定：按行并行，每行交给一个 block（grid = rows），行内列维由
-//   blockDim.x 个线程以 stride = blockDim.x 协同遍历（行宽 cols 可任意，不要求
-//   整除 blockDim；线程多配时只空转、不越界）。v0… 各版本均保持 SoftmaxKernel
-//   签名与“整矩阵算好、写满 output[0, rows*cols)”的输出约定，使
-//   test_softmax_kernel 能以函数指针统一驱动各版本。
-//
-// GPU 内核版本演进（详细推导与实测结论见 operators/softmax/README.md）：
-//   v0 每行一个 block、朴素两遍规约（先规约行最大值，再规约 Σexp；写回时第三
-//      次读该行重算 exp）—— 正确性基线，读行三次、无共享内存存储行数据；
-//   v1 online（单遍）…规划中
+// GPU 版本演进：
+//   v0 每线程处理一行、行内串行三遍 —— 正确性基线（无共享内存 / 同步）；
+//   v1 每行一个 block、行内由 blockDim.x 个线程协作 + 共享内存树形归约 ——
+//      读合并、Σexp 累加误差由整行串行降为块内分段 + 树形量级；
 //   v2 向量化访问…规划中
 // ============================================================================
 
@@ -28,31 +22,38 @@
 // ---------------------------------------------------------------------------
 // CPU 参考实现（主机端正确性基线）
 // ---------------------------------------------------------------------------
-// 逐行按同样公式实现，内部用 double 求最大值 / 指数 / 行和（参考值不自带
-// fp32 舍入误差），返回前把每个输出元素转回 float，便于与 GPU 的 fp32 结果
-// 同类型比较。
-void softmax_cpu(const float* input, float* output, int rows, int cols);
+// 逐行同公式，内部用 double 求最大值 / 指数 / 行和（参考值不自带 fp32 舍入
+// 误差），返回前转回 float 便于与 GPU 的 fp32 结果同类型比较。
+void softmax_cpu(const float* input, float* output, int M, int N);
 
 // ---------------------------------------------------------------------------
-// GPU softmax 内核（各版本的公共启动约束）
+// GPU 内核。公共输出契约：整矩阵算好并写满 output[0, rows*cols)，故
+// test_softmax_kernel 能以函数指针统一驱动各版本；但两版的行映射 / 启动配置
+// 不同，见各自声明。行宽 N 均可任意（含 N == 0 的空行：遍历循环 0 次、不读不写）。
 // ---------------------------------------------------------------------------
-//   * grid = rows（每 block 处理一行）；rows == 0 时至少配 1 个 block，
-//     内核由 row >= rows 越界判定直接返回（空输入安全）；
-//   * blockDim.x 为 2 的幂（默认 256），保证共享内存树形规约各轮均匀配对；
-//   * cols == 0 视为空行：不读不写（kernel 首行防御，避免 0 元素时除零）；
-//   * 动态共享内存 = blockDim.x * sizeof(float)：内核用 extern __shared__
-//     声明，大小由启动配置的第三参数给出（只存规约中间量，不存整行）。
 
-// v0 朴素两遍规约（正确性基线）：每 block 处理一行，线程以 stride = blockDim.x
-//   步进整行 —— 第①遍把每线程局部最大合并成行最大 m（共享内存树形 fmaxf 归约，
-//   同 reduce_v2 的折半形态）；第②遍以 (x - m) 求局部 Σexp 并树形归约成行和；
-//   最后每线程再次读行，写 y = exp(x - m) / 行和。全局内存每元素共读 3 次
-//   （两遍归约 + 写回重算 exp）、写 1 次，是最直观的数值稳定基线。
-__global__ void softmax_v0(const float* input, float* output, int rows, int cols);
+// v0 每线程处理一行（正确性基线）：
+//   * row = blockIdx.x * blockDim.x + threadIdx.x，行内由该线程串行三遍遍历
+//     （求行最大 → Σexp → 归一化写回）；每元素读行 3 次、warp 内各线程读不同
+//     行 → 访存不合并；
+//   * grid = ceil(M / blockDim.x)（M == 0 时也须 >= 1，由 row >= M 越界空转）；
+//   * 无共享内存 / 同步（动态共享内存 = 0）。Σexp 为 fp32 串行累加，舍入误差
+//     随行宽增长，是 v1 树形归约要解决的问题。
+__global__ void softmax_v0(const float* input, float* output, const int M,
+                           const int N);
+
+// v1 每行一个 block，行内列维由 blockDim.x 个线程以 stride = blockDim.x 协同
+//   遍历三次：行最大与行和各经一次共享内存折半树形归约，写回时第三次读行重算
+//   exp（不再经共享内存）：
+//   * row = blockIdx.x，grid = M（M == 0 时也须 >= 1，由 row >= M 越界空转）；
+//   * warp 内各线程同轮访问相邻列 → 全局读合并；N 不足 blockDim.x 时多余线程
+//     空转（不影响结果，-inf/0 为归约单位元）；N 超过 blockDim.x 时多轮 stride；
+//   * 动态共享内存 = blockDim.x * sizeof(float)（只装规约中间量，与行宽无关）；
+//   * blockDim.x 应为 2 的幂（默认 256），保证折半归约各轮均匀配对。
+__global__ void softmax_v1(const float* input, float* output, const int M,
+                           const int N);
 
 // ---------------------------------------------------------------------------
-// softmax 内核统一签名
+// softmax 内核统一签名（仅输出约定一致；启动配置随内核版本由 main.cu 给出）
 // ---------------------------------------------------------------------------
-// 各版本输出约定一致（整矩阵写入），故可共用同一测试驱动。
-using SoftmaxKernel = void (*)(const float* input, float* output, int rows,
-                               int cols);
+using SoftmaxKernel = void (*)(const float* input, float* output, int M, int N);
