@@ -5,8 +5,8 @@
 //
 // 接入新版本内核：在 reduce.cuh/.cu 添加声明与实现后，只需向下方 kKernels 表
 // 追加 {名字, 函数指针, 每线程元素数} 一项，即可自动复用全部测试场景。模板
-// 内核（reduce_v5）取固定实例 reduce_v5<kBlock> 作为函数指针（实例化声明见
-// reduce.cuh，显式实例化定义见 reduce.cu）。
+// 内核（reduce_v5）定义在 reduce.cuh，注册时取固定实例 reduce_v5<kBlock>
+// 作为函数指针。
 //
 // 构建：cmake --build build --target reduce && ./build/operators/reduce/reduce
 // ============================================================================
@@ -21,8 +21,8 @@
 namespace {
 
 // 每 block 线程数（各内核均要求为 2 的幂；v4/v5 另要求 >= 64，v6/v7 要求 >= 32
-// 且 <= 1024）。reduce_v5 的显式实例化固定为 BLOCK_SIZE = 256（见 reduce.cuh/
-// .cu），修改本值需同步。
+// 且 <= 1024）。reduce_v5 以 reduce_v5<kBlock> 注册；修改本值时需同时确认模板
+// 的 block 约束与测试场景仍匹配。
 constexpr int kBlock = 256;
 
 // 被测内核表。elems_per_thread：每线程加载的输入元素数，决定“覆盖 n 所需的

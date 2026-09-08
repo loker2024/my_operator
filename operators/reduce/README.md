@@ -99,6 +99,7 @@ out[i] = Σ_j x[i, j]  // 行求和（row-sum），输入 rows×cols，输出长
 ```
 reduce/
 ├── README.md   # 本文档：规划 + 结论总表
+├── notes/      # 学习笔记：reduce.md —— v0→v7 算法推导与优化讲解，与本文档互补
 ├── CMakeLists.txt  # 构建脚本（src/main.cu 存在即自动启用）
 └── src/        # CUDA 实现（普通内核 v0…v4、v6、v7 在 reduce.cu；模板内核 v5 内联于 reduce.cuh）
     ├── reduce.cuh / reduce.cu   # 算子接口与实现（被测试对象）
@@ -106,7 +107,7 @@ reduce/
     └── main.cu                  # 执行入口：注册 v0…v7，运行测试
 ```
 
-> 注：`triton/`（第二阶段 Triton 实现）与 `notes/`（学习笔记）属规划目录，尚未创建。
+> 注：`triton/`（第二阶段 Triton 实现）属规划目录，尚未创建。
 
 测试入口 `src/main.cu` 将 `reduce_v0` … `reduce_v7` 注册给同一测试驱动，
 覆盖三类场景（每组场景八个内核各跑一遍）：

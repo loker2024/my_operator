@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-09-08 文档与注释同步：根 README 更新 Reduce 的 v0…v7 与 80 项全量回归状态，补充未接入 CMake 的 `demo/` 说明；基准方法改为反映 Reduce 实际使用的确定性 `i % 1000` 输入；修正 `main.cu` 中 reduce_v5 模板实例化位置的过时说明。
+
 ### Added
 
 - 2026-09-04 14:18 仓库骨架与工程文档：`README.md`、`CHANGELOG.md`、`LICENSE`（MIT）、`.gitignore`、`.clang-format`。
@@ -23,3 +27,4 @@
 - 2026-09-07 16:22 `common/cuda_check.h`：`PrintDeviceInfo` 增加显存时钟（kHz）/ 位宽（bit）/ 理论峰值带宽输出（`cudaDeviceProp` 无带宽字段，按 `2 × memoryClockRate × busWidth/8` 估算并注明需跑 benchmark 才能测得实际带宽）。
 - 2026-09-07 16:22 `operators/reduce/README.md`：结论记录表补带宽可比性警示——n=2^20 工作集仅 ~4 MiB、远小于本机 32 MB L2（预热后输入驻留 L2），有效带宽反映片上 L2 命中带宽而非显存物理带宽，v5/v6 超过 GDDR6 理论峰值 256 GB/s 系缓存命中所致，不违反物理上限；要逼近/验证显存带宽需改用远大于 L2 的规模。
 - 2026-09-07 16:36 `operators/reduce`：新增并接入 `reduce_v7`（v6 两级 warp shuffle + `float4` 向量化加载与 grid-stride 扫描）——规整草稿实现（签名统一为 `ReduceKernel` 的 `const float*`，块内两次 shuffle 归约复用 `warpReduceSum`），补齐内核/接口注释，声明加入 `reduce.cuh`、注册进 `main.cu` 被测内核表（每线程元素数 4，推荐 grid = `n/(4*block)` = 1024），边界场景补 `n=block-2` 覆盖 `float4` 尾部余 2 路径；全量回归 8 内核 × 10 场景 80 项全部通过。算子 `README.md`：状态表 v7 标记完成，结论记录表回填 v7 严格基准（n=2^20 对齐 412.16 GB/s，同场 v5/v6 复测 329.99/341.39 → 相对 v6 约 +20.7%）；顶层 `README.md` Reduce 状态同步为 v0…v7。
+- 2026-09-08 13:09 `operators/reduce`：新增讲解型学习文档 `notes/reduce.md`（算法推导 + 逐步优化讲解）——v0→v7 每版按「瓶颈 → 动机 → 设计 → 关键实现 → 约束 → 实测」展开，含问题性能模型、两阶段归约设计说明、演进小结与瓶颈迁移主线、陷阱清单、扩展方向，与算子 `README.md`（规划 + 状态 + 结论表）分工互补；同步 `README.md` 目录布局并更正「notes/ 尚未创建」注记。

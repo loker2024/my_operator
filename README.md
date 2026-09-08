@@ -43,6 +43,7 @@ my_operator/
 │   └── reduce/                 # Reduce：CUDA → Triton（结构同 softmax）
 ├── docs/
 │   └── benchmark-methodology.md # 正确性验证与性能基准的统一口径
+├── demo/                       # 独立 CUDA 学习示例（不接入顶层 CMake）
 ├── CMakeLists.txt
 ├── CMakePresets.json           # 一条命令完成 Release/Debug 配置
 ├── CHANGELOG.md
@@ -80,6 +81,11 @@ cmake --build build --target softmax   # 目标名 = 算子目录名
 
 运行该可执行文件即执行该算子的「正确性验证 + 性能基准」，打印通过/失败与耗时统计（失败时返回非零退出码，便于脚本化）。
 
+`demo/` 保留三个可单独用 `nvcc` 编译的学习示例：`helloWorld.cu` 用于最小 CUDA
+启动验证，`demo_utils.cu` 演示向量加法、页锁定内存与统一计时工具，
+`demo_stream.cu` 演示 grid-stride 循环与多 stream 传输/计算流水。它们不属于
+顶层 CMake 的算子目标。
+
 其他 GPU 上构建时，用 `native` 覆盖默认架构即可：
 
 ```bash
@@ -96,11 +102,11 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
 
 ## 路线图
 
-- [ ] 仓库骨架与文档（本阶段）
+- [x] 仓库骨架与文档
 - [ ] Softmax：CUDA 核心版本（v0 → 优化变体）
 - [ ] GEMM：CUDA 核心版本（v0 → 优化变体）
 - [ ] Attention：CUDA 核心版本（v0 → Flash 风格）
-- [x] Reduce：CUDA 核心版本（v0 → 优化变体）   <!-- v0 交错寻址基线 + v1 连续寻址；全量 18 项测试通过（默认只跑正常流程 4 项，边界 / 异常场景由开关控制） -->
+- [x] Reduce：CUDA 核心版本（v0 → v7 优化变体）   <!-- 全量回归为 8 个内核 × 10 个场景 = 80 项；默认仅跑 2 个正常场景，即 16 项。 -->
 - [ ] 各算子正确性验证与基准记录
 - [ ] 逐个补充 Triton 版本，与 CUDA 对齐并对照性能
 
