@@ -14,7 +14,8 @@
 //   v0 每线程处理一行、行内串行三遍 —— 正确性基线（无共享内存 / 同步）；
 //   v1 每行一个 block、行内由 blockDim.x 个线程协作 + 共享内存树形归约 ——
 //      读合并、Σexp 累加误差由整行串行降为块内分段 + 树形量级；
-//   v2 向量化访问…规划中
+//   v2 每行一个 block、行内遍历同 v1，块内归约改两级 warp shuffle —— 归约在
+//      寄存器内完成、共享内存只做跨 warp 中转，块内同步降为 ~2 次 __syncthreads；
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -28,7 +29,7 @@ void softmax_cpu(const float* input, float* output, int M, int N);
 
 // ---------------------------------------------------------------------------
 // GPU 内核。公共输出契约：整矩阵算好并写满 output[0, rows*cols)，故
-// test_softmax_kernel 能以函数指针统一驱动各版本；但两版的行映射 / 启动配置
+// test_softmax_kernel 能以函数指针统一驱动各版本；但各版本的行映射 / 启动配置
 // 不同，见各自声明。行宽 N 均可任意（含 N == 0 的空行：遍历循环 0 次、不读不写）。
 // ---------------------------------------------------------------------------
 
@@ -51,6 +52,17 @@ __global__ void softmax_v0(const float* input, float* output, const int M,
 //   * 动态共享内存 = blockDim.x * sizeof(float)（只装规约中间量，与行宽无关）；
 //   * blockDim.x 应为 2 的幂（默认 256），保证折半归约各轮均匀配对。
 __global__ void softmax_v1(const float* input, float* output, const int M,
+                           const int N);
+
+// v2 每行一个 block，行内遍历与归约语义同 v1（三次 stride 扫行），仅把共享内存
+//   折半树形归约换成两级 warp shuffle（helper 与实现见 softmax.cu）：
+//   * row = blockIdx.x，grid = M（M == 0 时也须 >= 1，由 row >= M 越界空转）；
+//   * 读合并 / 空转线程 / 多轮 stride 等语义同 v1；额外要求 blockDim.x 为 32 的
+//     倍数（默认 256）且 <= 1024 —— shuffle 需整 warp 收敛，且 warp 部分值要能
+//     装进归约中转的 warp_results[32]；
+//   * 无动态共享内存（内部仅静态 __shared__ 做跨 warp 中转，与行宽无关）：
+//     启动配置的 smem_bytes = 0。
+__global__ void softmax_v2(const float* input, float* output, const int M,
                            const int N);
 
 // ---------------------------------------------------------------------------

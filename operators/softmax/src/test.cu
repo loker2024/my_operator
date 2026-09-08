@@ -31,7 +31,7 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
   }
 
   // 元素总数。启动网格按被测内核的行映射由调用方给出（见 softmax.cuh）：v0
-  // 线程铺满行号、v1 每行一个 block；空矩阵 rows == 0 时 grid 也须 >= 1，内核
+  // 线程铺满行号、v1/v2 每行一个 block；空矩阵 rows == 0 时 grid 也须 >= 1，内核
   // 由 row >= rows 越界判定空转。
   const std::int64_t count = static_cast<std::int64_t>(rows) * cols;
 
@@ -63,7 +63,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
 
   // 只有 cudaLaunchKernel 才能以“运行期内核函数指针”启动，从而一份驱动复用所有
   // 版本；args 中需放与形参 const 修饰严格匹配的指针。grid/block/smem_bytes 按
-  // 被测内核的映射给出（v0 无共享内存 smem_bytes = 0；v1 为 blockDim.x 个 float）。
+  // 被测内核的映射给出（v0/v2 无动态共享内存 smem_bytes = 0 —— v2 仅用内部静态
+  // __shared__ 中转；v1 为 blockDim.x 个 float）。
   const dim3 grid_dim(grid);
   const dim3 block_dim(block);
   const float* d_input_arg = d_input;
@@ -101,7 +102,7 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
   const float p95_ms = sorted_ms[(sample_count - 1) * 95 / 100];
 
   // 有效带宽 =（输入读 rows*cols 个 float + 输出写 rows*cols 个 float）/ 中位耗时
-  //（逻辑数据量，每元素计 1 读 1 写；v0/v1 内部实际多次读行、访问模式各异，
+  //（逻辑数据量，每元素计 1 读 1 写；v0/v1/v2 三遍各读行一次、访问模式各异，
   // 低效会直接反映为更低的“有效带宽”，见 README）。
   const double bytes_per_run = 2.0 * static_cast<double>(count) * sizeof(float);
   const double bandwidth_gbps = bytes_per_run / (median_ms * 1e6);

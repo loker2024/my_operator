@@ -19,14 +19,18 @@
 
 namespace {
 
-// 每 block 线程数（默认 256；应为 2 的幂，见 softmax.cuh 的 v1 约束）：
-// v0 用它铺满行号，v1 用它作为每行的协作线程数。
+// 每 block 线程数（默认 256）：v0 用它铺满行号，v1/v2 用它作为每行的协作线程
+// 数。256 同时满足 v1 的“2 的幂”（折半归约）与 v2 的“32 的倍数”（warp shuffle）
+// 约束，见 softmax.cuh 各版本的启动约束。
 constexpr int kBlock = 256;
 
-// 行映射方式 —— 决定每个场景的启动 grid 与动态共享内存，见 softmax.cuh 各版本。
+// 行映射与启动配置 —— 决定每个场景的启动 grid 与动态共享内存，见 softmax.cuh
+// 各版本的启动约束。
 enum class RowMap {
-  kThreadPerRow,  // v0：每线程处理一行，grid = ceil(rows / block)，无共享内存
-  kBlockPerRow,   // v1：每行一个 block，grid = rows，smem = block * sizeof(float)
+  kThreadPerRow,        // v0：每线程处理一行，grid = ceil(rows / block)，无共享内存
+  kBlockPerRow,         // v1：每行一个 block，grid = rows，smem = block * sizeof(float)
+  kBlockPerRowShuffle,  // v2：每行一个 block + 两级 warp shuffle 归约，grid = rows，
+                        //     无动态共享内存（内部仅静态 __shared__ 中转）
 };
 
 // 被测内核表。row_map 为该内核的行映射方式。
@@ -41,6 +45,8 @@ const KernelEntry kKernels[] = {
      RowMap::kThreadPerRow},
     {"softmax_v1 (每行一个 block, 块内树形归约)", softmax_v1,
      RowMap::kBlockPerRow},
+    {"softmax_v2 (每行一个 block, warp shuffle 归约)", softmax_v2,
+     RowMap::kBlockPerRowShuffle},
 };
 
 // 测试场景。label 仅用于打印；rows × cols 为矩阵形状，grid/smem 由被测内核的
@@ -56,16 +62,17 @@ constexpr size_t CountOf(const Scenario (&)[N]) {
   return N;
 }
 
-// 场景组 A：正常流程 —— 大规模形状（行数远超 block，两版本的 grid 都够大）。
+// 场景组 A：正常流程 —— 大规模形状（行数远超 block，三版本的 grid 都够大）。
 const Scenario kNormalScenarios[] = {
     {"正常: 4096x4096 (约 64 MiB 输入)", 4096, 4096},
     {"正常: 16384x1024 (宽行场景)", 16384, 1024},
 };
 
 // 场景组 B：边界条件 —— 行数在 v0 的“block 线程铺满行号”覆盖边界附近（差 1 /
-// 恰满载 / 超 1 / 末 block 仅余 1 行），列宽在 v1 的“行内协作”边界附近（差 1 /
-// 恰满载 / 超 1 / 第 2 轮仅余 1 列）；两种维度分别覆盖两版本的越界空转、空转
-// 线程与多轮 stride 等路径。
+// 恰满载 / 超 1 / 末 block 仅余 1 行），列宽在 v1/v2 的“行内协作”边界附近（差 1 /
+// 恰满载 / 超 1 / 第 2 轮仅余 1 列，以及 warp 边界附近的 31/32/33 —— v2 warp
+// shuffle 归约的关键路径：仅前几个 warp 持有数据、其余 warp 以归约单位元参与）；
+// 两种维度分别覆盖三版本的越界空转、空转线程与多轮 stride 等路径。
 const Scenario kBoundaryScenarios[] = {
     {"边界: 1x1, 最小非空", 1, 1},
     // 行数边界（v0 关键路径）
@@ -73,11 +80,15 @@ const Scenario kBoundaryScenarios[] = {
     {"边界: blockx3, 恰 1 个 block 满线程", kBlock, 3},
     {"边界: (block+1)x3, 多 1 行需第 2 个 block", kBlock + 1, 3},
     {"边界: (2*block-1)x3, 末 block 仅余 1 行", 2 * kBlock - 1, 3},
-    // 行宽边界（v1 关键路径）
+    // 行宽边界（v1/v2 关键路径）
     {"边界: 3x(block-1), 行宽差 1 满载", 3, kBlock - 1},
     {"边界: 3xblock, 行宽恰 1 轮满载", 3, kBlock},
     {"边界: 3x(block+1), 行宽需 2 轮", 3, kBlock + 1},
     {"边界: 3x(2*block-1), 第 2 轮仅余 1 列", 3, 2 * kBlock - 1},
+    // warp 边界（v2 关键路径：行宽恰 1 个 warp、差 1 与超 1）
+    {"边界: 3x(32-1), warp 内差 1 列满载", 3, 31},
+    {"边界: 3x32, 行宽恰 1 个 warp 满载", 3, 32},
+    {"边界: 3x(32+1), 第 2 个 warp 仅 1 列有效", 3, 33},
 };
 
 // 场景组 C：异常 / 健壮性 —— 空矩阵、空行。
@@ -87,13 +98,15 @@ const Scenario kAbnormalScenarios[] = {
 };
 
 // 按行映射方式求“覆盖全部行”的最小 grid；rows == 0 时也须 >= 1（内核以
-// row >= rows 越界空转，见 softmax.cuh）。
+// row >= rows 越界空转，见 softmax.cuh）。kBlockPerRow / kBlockPerRowShuffle
+// 都是每行一个 block → grid = rows。
 int GridFor(int rows, RowMap row_map) {
   if (rows == 0) return 1;
   switch (row_map) {
     case RowMap::kThreadPerRow:
       return (rows + kBlock - 1) / kBlock;
     case RowMap::kBlockPerRow:
+    case RowMap::kBlockPerRowShuffle:
       return rows;
   }
   return 1;  // 不可达
@@ -103,9 +116,11 @@ int GridFor(int rows, RowMap row_map) {
 std::size_t SmemFor(RowMap row_map) {
   switch (row_map) {
     case RowMap::kThreadPerRow:
-      return 0;
+      return 0;  // v0 无共享内存
     case RowMap::kBlockPerRow:
-      return static_cast<std::size_t>(kBlock) * sizeof(float);
+      return static_cast<std::size_t>(kBlock) * sizeof(float);  // v1 动态共享内存
+    case RowMap::kBlockPerRowShuffle:
+      return 0;  // v2 仅用内部静态 __shared__ 中转，无需动态共享内存
   }
   return 0;  // 不可达
 }
