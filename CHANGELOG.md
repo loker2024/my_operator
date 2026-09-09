@@ -25,6 +25,13 @@
 
 ### Added
 
+- 2026-09-09 19:55 `operators/softmax`：注册并补齐 `softmax_v4` 的测试
+  - `softmax.cuh`：补 v4 声明与启动约束（每行一个 block、两级 warp shuffle 归约；动态共享内存 `N * sizeof(float)` 缓存整行、全局读 1 遍 / 每元素只算 1 次 exp；默认 48 KiB 上限内免 opt-in），并同步头部版本演进说明
+  - `main.cu`：被测内核表注册 v4 —— `RowMap` 新增 `kBlockPerRowRowCache`，`SmemFor` 改为随列宽取 `cols * sizeof(float)`；`GridFor` / 相关注释同步
+  - `test.cuh` / `test.cu`：注释版本口径同步为 v0…v4（含 v4 的动态共享内存启动说明）
+  - 全量回归 5 内核 × 20 场景 100 项全部通过（默认档 10 项通过）
+  - `operators/softmax/README.md`：状态表 / 版本规划说明 / 参考规模 / 测试章节补 v4，结论记录表回填同场开发采样（v4 4096² 0.7828 ms / 171.45 GB/s、宽行 0.7482 ms / 179.40 GB/s，max_err 1.223e-06 / 1.237e-06，同场相对 v3 −8.0% / −11.8% —— 整行缓存少读行数的收益被 smem 往返与占用下降抵消）
+  - 顶层 `README.md` / `AGENTS.md`：Softmax 状态同步为进行中（v0/v1/v2/v3/v4 完成，全量回归 100 项通过）
 - 2026-09-04 14:18 仓库骨架与工程文档
   - 新增 `README.md`、`CHANGELOG.md`、`LICENSE`（MIT）、`.gitignore`、`.clang-format`
 - 2026-09-04 14:18 CMake 构建框架

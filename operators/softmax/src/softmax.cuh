@@ -19,6 +19,10 @@
 //   v3 行遍历与归约同 v2，行内访问按列宽分派：列宽为 4 的倍数时以 float4 向量
 //      化（16 B 对齐，读/写指令数为标量 1/4），否则整行回退标量 —— 任意列宽
 //      均正确，向量化收益限于对齐宽行；
+//   v4 行映射与归约同 v2/v3，行内遍历改“整行缓存一遍读”：动态共享内存按行宽
+//      缓存整行，①读全局求行最大的同时写缓存、②③从缓存读（原地覆盖为 exp
+//      值）—— 全局读降为 1 遍、达读+写的理论下限，代价是动态共享内存随行宽
+//      增长（上限约束见 v4 声明）；
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -78,6 +82,20 @@ __global__ void softmax_v2(const float* input, float* output, const int M,
 //   * 启动约束同 v2：row = blockIdx.x、grid = M、blockDim.x 为 32 的倍数（默认
 //     256）且 <= 1024；smem_bytes = 0。
 __global__ void softmax_v3(const float* input, float* output, const int M,
+                           const int N);
+
+// v4 每行一个 block，行内遍历改“整行缓存一遍读”（行映射 / 两级 warp shuffle
+//   归约 / 按列宽分派同 v2/v3 框架）：
+//   * 动态共享内存 = N * sizeof(float)，按行宽缓存整行 x：① 读全局求行最大的
+//     同时把该行写进缓存（N % 4 == 0 时以 float4 槽 16 B 整写，否则标量槽写）；
+//     ② 从缓存读 x 重算 exp、原地覆盖为 exp 值并累加行和；③ 从缓存读 exp 归一
+//     化写回 —— 全局流量 = 读 1 遍 + 写 1 遍（理论下限；v0~v3 每元素都读行 3
+//     次，见 README 的演进动机）；
+//   * 启动约束同 v2/v3：row = blockIdx.x、grid = M、blockDim.x 为 32 的倍数
+//     （默认 256）且 <= 1024；额外要求 N * sizeof(float) <= 每 block 动态共享
+//     内存上限（默认 48 KiB 内免 opt-in，如 N = 4096 需 16 KiB；更大行宽须以
+//     cudaFuncSetAttribute 提额）。N == 0 时空转，smem_bytes = 0 即可。
+__global__ void softmax_v4(const float* input, float* output, const int M,
                            const int N);
 
 // ---------------------------------------------------------------------------

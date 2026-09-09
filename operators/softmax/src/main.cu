@@ -19,8 +19,8 @@
 
 namespace {
 
-// 每 block 线程数（默认 256）：v0 用它铺满行号，v1/v2/v3 用它作为每行的协作
-// 线程数。256 同时满足 v1 的"2 的幂"（折半归约）与 v2/v3 的"32 的倍数"
+// 每 block 线程数（默认 256）：v0 用它铺满行号，v1/v2/v3/v4 用它作为每行的协作
+// 线程数。256 同时满足 v1 的"2 的幂"（折半归约）与 v2/v3/v4 的"32 的倍数"
 // （warp shuffle）约束，见 softmax.cuh 各版本的启动约束。
 constexpr int kBlock = 256;
 
@@ -32,6 +32,8 @@ enum class RowMap {
   kBlockPerRowShuffle,  // v2/v3：每行一个 block + 两级 warp shuffle 归约，grid = rows，
                         //     无动态共享内存（内部仅静态 __shared__ 中转）。v3 的
                         //     float4 向量化只影响行内访问，启动配置与 v2 相同
+  kBlockPerRowRowCache,  // v4：每行一个 block + 动态共享内存缓存整行，grid = rows，
+                         //     smem = cols * sizeof(float)（随行宽，见 softmax.cuh v4）
 };
 
 // 被测内核表。row_map 为该内核的行映射方式。
@@ -50,6 +52,8 @@ const KernelEntry kKernels[] = {
      RowMap::kBlockPerRowShuffle},
     {"softmax_v3 (每行一个 block, float4 向量化)", softmax_v3,
      RowMap::kBlockPerRowShuffle},
+    {"softmax_v4 (每行一个 block, 整行 smem 缓存一遍读)", softmax_v4,
+     RowMap::kBlockPerRowRowCache},
 };
 
 // 测试场景。label 仅用于打印；rows × cols 为矩阵形状，grid/smem 由被测内核的
@@ -112,8 +116,8 @@ const Scenario kAbnormalScenarios[] = {
 };
 
 // 按行映射方式求“覆盖全部行”的最小 grid；rows == 0 时也须 >= 1（内核以
-// row >= rows 越界空转，见 softmax.cuh）。kBlockPerRow / kBlockPerRowShuffle
-// 都是每行一个 block → grid = rows。
+// row >= rows 越界空转，见 softmax.cuh）。kBlockPerRow / kBlockPerRowShuffle /
+// kBlockPerRowRowCache 都是每行一个 block → grid = rows。
 int GridFor(int rows, RowMap row_map) {
   if (rows == 0) return 1;
   switch (row_map) {
@@ -121,13 +125,15 @@ int GridFor(int rows, RowMap row_map) {
       return (rows + kBlock - 1) / kBlock;
     case RowMap::kBlockPerRow:
     case RowMap::kBlockPerRowShuffle:
+    case RowMap::kBlockPerRowRowCache:
       return rows;
   }
   return 1;  // 不可达
 }
 
-// 按行映射方式求每 block 的动态共享内存（字节数，见 softmax.cuh）。
-std::size_t SmemFor(RowMap row_map) {
+// 按行映射方式求每 block 的动态共享内存（字节数，见 softmax.cuh）；除 v4
+//（kBlockPerRowRowCache 缓存整行、随列宽 cols 增长）外均与行宽无关。
+std::size_t SmemFor(RowMap row_map, int cols) {
   switch (row_map) {
     case RowMap::kThreadPerRow:
       return 0;  // v0 无共享内存
@@ -135,6 +141,8 @@ std::size_t SmemFor(RowMap row_map) {
       return static_cast<std::size_t>(kBlock) * sizeof(float);  // v1 动态共享内存
     case RowMap::kBlockPerRowShuffle:
       return 0;  // v2/v3 仅用内部静态 __shared__ 中转，无需动态共享内存
+    case RowMap::kBlockPerRowRowCache:
+      return static_cast<std::size_t>(cols) * sizeof(float);  // v4 整行缓存，随行宽
   }
   return 0;  // 不可达
 }
@@ -158,7 +166,7 @@ bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
       std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
       const bool ok = test_softmax_kernel(kern.kernel, full_name, s.rows, s.cols,
                                           GridFor(s.rows, kern.row_map), kBlock,
-                                          SmemFor(kern.row_map),
+                                          SmemFor(kern.row_map, s.cols),
                                           strict_benchmark);
       all_ok = ok && all_ok;
       local_passed += ok ? 1 : 0;
