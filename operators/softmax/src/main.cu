@@ -19,8 +19,8 @@
 
 namespace {
 
-// 每 block 线程数（默认 256）：v0 用它铺满行号，v1/v2/v3/v4 用它作为每行的协作
-// 线程数。256 同时满足 v1 的"2 的幂"（折半归约）与 v2/v3/v4 的"32 的倍数"
+// 每 block 线程数（默认 256）：v0 用它铺满行号，v1/v2/v3/v4/v5 用它作为每行的
+// 协作线程数。256 同时满足 v1 的"2 的幂"（折半归约）与 v2/v3/v4/v5 的"32 的倍数"
 // （warp shuffle）约束，见 softmax.cuh 各版本的启动约束。
 constexpr int kBlock = 256;
 
@@ -32,8 +32,9 @@ enum class RowMap {
   kBlockPerRowShuffle,  // v2/v3：每行一个 block + 两级 warp shuffle 归约，grid = rows，
                         //     无动态共享内存（内部仅静态 __shared__ 中转）。v3 的
                         //     float4 向量化只影响行内访问，启动配置与 v2 相同
-  kBlockPerRowRowCache,  // v4：每行一个 block + 动态共享内存缓存整行，grid = rows，
-                         //     smem = cols * sizeof(float)（随行宽，见 softmax.cuh v4）
+  kBlockPerRowRowCache,  // v4/v5：每行一个 block + 动态共享内存缓存整行（v4 缓存
+                         //     x、v5 缓存 exp），grid = rows，smem = cols * sizeof
+                         //     (float)（随行宽，启动约束见 softmax.cuh v4/v5）
 };
 
 // 被测内核表。row_map 为该内核的行映射方式。
@@ -52,7 +53,9 @@ const KernelEntry kKernels[] = {
      RowMap::kBlockPerRowShuffle},
     {"softmax_v3 (每行一个 block, float4 向量化)", softmax_v3,
      RowMap::kBlockPerRowShuffle},
-    {"softmax_v4 (每行一个 block, 整行 smem 缓存一遍读)", softmax_v4,
+    {"softmax_v4 (每行一个 block, 整行 smem 缓存 x 一遍读)", softmax_v4,
+     RowMap::kBlockPerRowRowCache},
+    {"softmax_v5 (每行一个 block, 全局读2遍 float4, smem 存 exp)", softmax_v5,
      RowMap::kBlockPerRowRowCache},
 };
 
@@ -69,20 +72,20 @@ constexpr size_t CountOf(const Scenario (&)[N]) {
   return N;
 }
 
-// 场景组 A：正常流程 —— 大规模形状（行数远超 block，三版本的 grid 都够大）。
+// 场景组 A：正常流程 —— 大规模形状（行数远超 block，各版本的 grid 都够大）。
 const Scenario kNormalScenarios[] = {
     {"正常: 4096x4096 (约 64 MiB 输入)", 4096, 4096},
     {"正常: 16384x1024 (宽行场景)", 16384, 1024},
 };
 
 // 场景组 B：边界条件 —— 行数在 v0 的"block 线程铺满行号"覆盖边界附近（差 1 /
-// 恰满载 / 超 1 / 末 block 仅余 1 行），列宽在 v1/v2/v3 的"行内协作"边界附近
-// （差 1 / 恰满载 / 超 1 / 第 2 轮仅余 1 列，以及 warp 边界附近的 31/32/33 ——
-// v2/v3 warp shuffle 归约的关键路径：仅前几个 warp 持有数据、其余 warp 以归约
-// 单位元参与）；两种维度分别覆盖各版本的越界空转、空转线程与多轮 stride 等
-// 路径。非 4 倍列宽场景对 v3 走标量回退；末尾另补 4 个 float4 对齐边界（列宽
-// 为 4 的倍数、向量主循环在 block 线程数附近）专测 v3 的向量化路径，对 v0/v1/v2
-// 只是多一轮 stride 冗余覆盖（无副作用）。
+// 恰满载 / 超 1 / 末 block 仅余 1 行），列宽在 v1/v2/v3/v4/v5 的"行内协作"边界
+// 附近（差 1 / 恰满载 / 超 1 / 第 2 轮仅余 1 列，以及 warp 边界附近的 31/32/33 ——
+// v2/v3/v4/v5 warp shuffle 归约的关键路径：仅前几个 warp 持有数据、其余 warp 以
+// 归约单位元参与）；两种维度分别覆盖各版本的越界空转、空转线程与多轮 stride 等
+// 路径。非 4 倍列宽场景对 v3/v4/v5 走标量回退；末尾另补 4 个 float4 对齐边界
+// （列宽为 4 的倍数、向量主循环在 block 线程数附近）专测 v3/v4/v5 的向量化路径，
+// 对 v0/v1/v2 只是多一轮 stride 冗余覆盖（无副作用）。
 const Scenario kBoundaryScenarios[] = {
     {"边界: 1x1, 最小非空", 1, 1},
     // 行数边界（v0 关键路径）
@@ -90,16 +93,16 @@ const Scenario kBoundaryScenarios[] = {
     {"边界: blockx3, 恰 1 个 block 满线程", kBlock, 3},
     {"边界: (block+1)x3, 多 1 行需第 2 个 block", kBlock + 1, 3},
     {"边界: (2*block-1)x3, 末 block 仅余 1 行", 2 * kBlock - 1, 3},
-    // 行宽边界（v1/v2/v3 标量回退关键路径）
+    // 行宽边界（v1/v2/v3/v4/v5 标量回退关键路径）
     {"边界: 3x(block-1), 行宽差 1 满载", 3, kBlock - 1},
     {"边界: 3xblock, 行宽恰 1 轮满载", 3, kBlock},
     {"边界: 3x(block+1), 行宽需 2 轮", 3, kBlock + 1},
     {"边界: 3x(2*block-1), 第 2 轮仅余 1 列", 3, 2 * kBlock - 1},
-    // warp 边界（v2/v3 关键路径：行宽恰 1 个 warp、差 1 与超 1）
+    // warp 边界（v2/v3/v4/v5 关键路径：行宽恰 1 个 warp、差 1 与超 1）
     {"边界: 3x(32-1), warp 内差 1 列满载", 3, 31},
     {"边界: 3x32, 行宽恰 1 个 warp 满载", 3, 32},
     {"边界: 3x(32+1), 第 2 个 warp 仅 1 列有效", 3, 33},
-    // float4 对齐边界（v3 向量化关键路径：列宽为 4 的倍数 → 行首 16 B 对齐，
+    // float4 对齐边界（v3/v4/v5 向量化关键路径：列宽为 4 的倍数 → 行首 16 B 对齐，
     // 向量主循环在 block 线程数附近 —— n4 = block-1 / block / block+1 /
     // 2*block-1，对应空转 / 恰 1 轮满载 / 第 2 轮仅余 1 个 / 第 2 轮余 block-1 个）
     {"边界: 3x(4*(block-1)), float4 差 1 满载", 3, 4 * (kBlock - 1)},
@@ -131,7 +134,7 @@ int GridFor(int rows, RowMap row_map) {
   return 1;  // 不可达
 }
 
-// 按行映射方式求每 block 的动态共享内存（字节数，见 softmax.cuh）；除 v4
+// 按行映射方式求每 block 的动态共享内存（字节数，见 softmax.cuh）；除 v4/v5
 //（kBlockPerRowRowCache 缓存整行、随列宽 cols 增长）外均与行宽无关。
 std::size_t SmemFor(RowMap row_map, int cols) {
   switch (row_map) {
@@ -142,7 +145,7 @@ std::size_t SmemFor(RowMap row_map, int cols) {
     case RowMap::kBlockPerRowShuffle:
       return 0;  // v2/v3 仅用内部静态 __shared__ 中转，无需动态共享内存
     case RowMap::kBlockPerRowRowCache:
-      return static_cast<std::size_t>(cols) * sizeof(float);  // v4 整行缓存，随行宽
+      return static_cast<std::size_t>(cols) * sizeof(float);  // v4/v5 整行缓存，随行宽
   }
   return 0;  // 不可达
 }

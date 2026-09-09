@@ -1,4 +1,4 @@
-// softmax.cu —— softmax.cuh 声明的实现：CPU 参考 + softmax_v0/v1/v2/v3/v4 内核。
+// softmax.cu —— softmax.cuh 声明的实现：CPU 参考 + softmax_v0/v1/v2/v3/v4/v5 内核。
 // 接口契约 / 启动约束 / 版本差异见 softmax.cuh，推导与实测见 README.md。
 
 
@@ -360,5 +360,89 @@ __global__ void softmax_v4(const float* input, float* output, const int M, const
 	const float inv_sum = 1.0f / sum;
 	for (int i = tid; i < N; i += blockDim.x) {
 		y[i] = smem[i] * inv_sum;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// softmax_v5 —— 每行一个 block：全局读 2 遍 + float4，exp 只算 1 次
+// ---------------------------------------------------------------------------
+// v4 前身思路的原样接入：行内不再把 x 缓存进 smem，而是改全局读 2 遍 —— ① 读全局
+// 求行最大（读后即弃）；② 再读全局算 exp、把 exp 值写进动态共享内存（整行）并累加
+// 行和；③ 从 smem 读 exp 乘 inv_sum 归一化写回。三种资源流量对比：
+//   * v3：全局读 3 遍 + exp 算 2 次 + 写 1 遍（②③ 各算一次 exp）；
+//   * v4：全局读 1 遍 + exp 算 1 次 + 写 1 遍，但 x 要 smem 写 1 次 + 读 1 次往返
+//     （x、exp 两轮缓存，smem 流量是 v5 的两倍）；
+//   * v5：全局读 2 遍 + exp 算 1 次 + 写 1 遍，smem 只存 exp（写 1 读 1）—— 以
+//     “多读 1 遍全局”换掉 v4 的 “x 经 smem 往返”，全局读带宽富余时更划算（v4 的
+//     smem 往返被怀疑是主要开销，见 README 结论记录）。
+// 启动约束同 v4，见 softmax.cuh 的 v5 声明。实现要点与 v4 一致：N % 4 == 0 时行首
+// 16 B 对齐，①/②/③ 全走 float4（② 的 4 个 exp 一次算完并 16 B 整写进 smem4[i]，
+// ③ 乘 inv_sum 后 float4 整写回 y —— 读/写指令数均为标量 1/4）；否则整行回退标量。
+__global__ void softmax_v5(const float* input, float* output, const int M, const int N) {
+	extern __shared__ float4 smem4[];  // 动态共享内存：N * sizeof(float)，只装 exp 值
+	const int row = blockIdx.x;
+	if (row >= M) return;  // 空矩阵 / 超配 grid：越界行空转
+	const int tid = threadIdx.x;
+
+	const float* x = input + row * N;
+	float* y = output + row * N;
+	float* smem = reinterpret_cast<float*>(smem4);  // 标量槽视图（[col] 布局）
+
+	if (N % 4 == 0) {
+		// 列宽为 4 的倍数：行首 16 B 对齐（空行 N == 0 时 n4 == 0，各遍循环 0 次）
+		const int n4 = N / 4;
+		const float4* x4 = reinterpret_cast<const float4*>(x);
+		float4* y4 = reinterpret_cast<float4*>(y);
+
+		// ① 行最大 m：float4 全局读 1 遍、分量逐一 fmaxf，读后即弃（不落 smem）
+		float local_max = -INFINITY;
+		for (int i = tid; i < n4; i += blockDim.x) {
+			const float4 v = x4[i];
+			local_max = fmaxf(local_max, v.x);
+			local_max = fmaxf(local_max, v.y);
+			local_max = fmaxf(local_max, v.z);
+			local_max = fmaxf(local_max, v.w);
+		}
+		const float row_max = blockReduceMaxShuffle(local_max);
+
+		// ② Σexp：再全局读 1 遍，4 个 exp 一次算完、16 B 整写进 smem4[i]（存 exp
+		// 供 ③ 用），同时就地累加 local_sum —— 每元素至此只算 1 次 exp
+		float local_sum = 0.0f;
+		for (int i = tid; i < n4; i += blockDim.x) {
+			const float4 v = x4[i];
+			const float4 e = make_float4(expf(v.x - row_max), expf(v.y - row_max),
+			                             expf(v.z - row_max), expf(v.w - row_max));
+			smem4[i] = e;
+			local_sum += (e.x + e.y) + (e.z + e.w);
+		}
+		const float row_sum = blockReduceSumShuffle(local_sum);  // 尾部同步：exp 缓存全就绪
+
+		// ③ 归一化写回：从 smem 读 exp、乘 inv_sum 后 float4 整写回 y（无标量尾部）
+		const float inv_sum = 1.0f / row_sum;
+		for (int i = tid; i < n4; i += blockDim.x) {
+			const float4 e = smem4[i];
+			y4[i] = make_float4(e.x * inv_sum, e.y * inv_sum, e.z * inv_sum,
+			                    e.w * inv_sum);
+		}
+	} else {
+		// 列宽非 4 的倍数：行首不保证 16 B 对齐，①/②/③ 整行回退标量（语义同 v2）
+		float local_max = -INFINITY;
+		for (int i = tid; i < N; i += blockDim.x) {
+			local_max = fmaxf(local_max, x[i]);
+		}
+		const float row_max = blockReduceMaxShuffle(local_max);
+
+		float local_sum = 0.0f;
+		for (int i = tid; i < N; i += blockDim.x) {
+			const float ev = expf(x[i] - row_max);
+			smem[i] = ev;  // 存 exp 值供 ③ 归一化用（缓存内容为 exp，而非 v4 的 x）
+			local_sum += ev;
+		}
+		const float row_sum = blockReduceSumShuffle(local_sum);
+
+		const float inv_sum = 1.0f / row_sum;
+		for (int i = tid; i < N; i += blockDim.x) {
+			y[i] = smem[i] * inv_sum;
+		}
 	}
 }

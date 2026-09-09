@@ -25,6 +25,14 @@
 
 ### Added
 
+- 2026-09-09 20:10 `operators/softmax`：新增 `softmax_v5`（全局读 2 遍 + float4，动态共享内存只缓存 exp）并接入测试
+  - `softmax.cuh`：补 v5 声明与启动约束（与 v4 同为每行一个 block + 整行动态共享内存缓存，但缓存内容是 exp 而非 x：① 全局读 1 遍求行最大、② 再全局读 1 遍算 exp 并 16 B 整写进 smem 累加行和、③ 从 smem 读 exp 归一化 float4 写回 —— 以多读 1 遍全局换掉 v4 的 x smem 写/读往返），同步头部版本演进说明
+  - `softmax.cu`：追加 v5 实现并给实现要点注释；文件头版本清单补 v5
+  - `main.cu`：被测内核表注册 v5（复用 `RowMap::kBlockPerRowRowCache`：`grid = rows`、smem = `cols * sizeof(float)`），场景注释与 SmemFor / 线程数注释版本口径同步到 v4/v5
+  - `test.cuh` / `test.cu`：注释版本口径同步为 v0…v5（v4/v5 的 smem 均随列宽增长，分别缓存整行 x / exp）
+  - 全量回归 6 内核 × 20 场景 120 项全部通过（默认档 12 项通过）
+  - `operators/softmax/README.md`：状态表 / 版本规划 / 参考规模 / 测试章节补 v5，结论记录表回填同场开发采样（v5 4096² 0.7482 ms / 179.40 GB/s、宽行 0.6703 ms / 200.23 GB/s 为六版本同场最高，max_err 1.223e-06 / 1.237e-06 —— 宽行下缓存整行 / 只算 1 次 exp 的收益兑现，4096² 仍低于 v2/v3 的 ~190 GB/s，占用仍是主瓶颈）
+  - 顶层 `README.md` / `AGENTS.md`：Softmax 状态同步为进行中（v0/v1/v2/v3/v4/v5 完成，全量回归 120 项通过）
 - 2026-09-09 19:55 `operators/softmax`：注册并补齐 `softmax_v4` 的测试
   - `softmax.cuh`：补 v4 声明与启动约束（每行一个 block、两级 warp shuffle 归约；动态共享内存 `N * sizeof(float)` 缓存整行、全局读 1 遍 / 每元素只算 1 次 exp；默认 48 KiB 上限内免 opt-in），并同步头部版本演进说明
   - `main.cu`：被测内核表注册 v4 —— `RowMap` 新增 `kBlockPerRowRowCache`，`SmemFor` 改为随列宽取 `cols * sizeof(float)`；`GridFor` / 相关注释同步

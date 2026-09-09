@@ -31,8 +31,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
   }
 
   // 元素总数。启动网格按被测内核的行映射由调用方给出（见 softmax.cuh）：v0
-  // 线程铺满行号、v1/v2/v3/v4 每行一个 block；空矩阵 rows == 0 时 grid 也须 >= 1，
-  // 内核由 row >= rows 越界判定空转。
+  // 线程铺满行号、v1/v2/v3/v4/v5 每行一个 block；空矩阵 rows == 0 时 grid 也须
+  // >= 1，内核由 row >= rows 越界判定空转。
   const std::int64_t count = static_cast<std::int64_t>(rows) * cols;
 
   // 输入取确定性伪随机（行/列相关），范围 [-10, 10)：可复现，且不会让 exp 溢出
@@ -64,8 +64,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
   // 只有 cudaLaunchKernel 才能以“运行期内核函数指针”启动，从而一份驱动复用所有
   // 版本；args 中需放与形参 const 修饰严格匹配的指针。grid/block/smem_bytes 按
   // 被测内核的映射给出（v0 无动态共享内存 smem_bytes = 0；v1 为 blockDim.x 个
-  // float；v2/v3 = 0 —— 仅用内部静态 __shared__ 中转；v4 为 cols 个 float，整行
-  // 缓存）。
+  // float；v2/v3 = 0 —— 仅用内部静态 __shared__ 中转；v4/v5 为 cols 个 float ——
+  // v4 缓存整行 x、v5 缓存整行 exp，随列宽增长）。
   const dim3 grid_dim(grid);
   const dim3 block_dim(block);
   const float* d_input_arg = d_input;

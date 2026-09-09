@@ -23,6 +23,10 @@
 //      缓存整行，①读全局求行最大的同时写缓存、②③从缓存读（原地覆盖为 exp
 //      值）—— 全局读降为 1 遍、达读+写的理论下限，代价是动态共享内存随行宽
 //      增长（上限约束见 v4 声明）；
+//   v5 行映射与归约同 v2/v3，行内遍历改“全局读 2 遍”：① 读全局求行最大（读后
+//      即弃），② 再读全局算 exp、把 exp 值写进动态共享内存并累加行和，③ 从 smem
+//      读 exp 归一化写回 —— 以“多读 1 遍全局”换掉 v4 对 x 的 smem 写/读往返，
+//      exp 仍只算 1 次（v4 前身思路，缓存整行但缓存内容是 exp 而非 x）；
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -96,6 +100,17 @@ __global__ void softmax_v3(const float* input, float* output, const int M,
 //     内存上限（默认 48 KiB 内免 opt-in，如 N = 4096 需 16 KiB；更大行宽须以
 //     cudaFuncSetAttribute 提额）。N == 0 时空转，smem_bytes = 0 即可。
 __global__ void softmax_v4(const float* input, float* output, const int M,
+                           const int N);
+
+// v5 每行一个 block，行内遍历改“全局读 2 遍 + float4”（v4 前身思路原样接入）：
+//   * 与 v4 同为“共享内存缓存整行”，但缓存内容从 x 换成 exp：① 全局 float4 读 1
+//     遍求行最大（读后即弃）；② 再全局 float4 读 1 遍算 exp、16 B 整写进动态共享
+//     内存并累加行和；③ 从 smem 读 exp 乘 inv_sum 后 float4 整写回 y —— 每元素
+//     全局读 2 遍 + 写 1 遍、exp 只算 1 次；相比 v4，用“多读 1 遍全局”换掉“x 经
+//     smem 的写 + 读往返”（v4 的 smem 流量为 v5 的两倍），全局读带宽富余时更划算；
+//   * 动态共享内存 = N * sizeof(float)（只装整行 exp，启动约束与上限同 v4 声明）；
+//     列宽为 4 的倍数时 ①②③ 全走 float4，否则整行回退标量；N == 0 时空转。
+__global__ void softmax_v5(const float* input, float* output, const int M,
                            const int N);
 
 // ---------------------------------------------------------------------------
