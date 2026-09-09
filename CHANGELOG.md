@@ -17,6 +17,11 @@
   - 目录结构树按仓库实际拆分 reduce（含 `notes/reduce.md`、`src/`），并标明 softmax / gemm / attention 为 src/ 尚未创建的骨架
   - 构建示例目标由未启用的 softmax 改为当前唯一启用的 reduce
   - 路线图勾选 Reduce 的验证 / 基准记录，收窄剩余项为 Softmax / GEMM / Attention
+- 2026-09-09 17:35 按 AGENTS.md 注释规范去重收敛 reduce / softmax 源码注释
+  - `reduce.cu`：各版本内核前的长段解说注释收敛为“实现结构 + 指向 `reduce.cuh` / `README.md`”，删除与声明注释重复的覆盖口径、启动约束与推导叙述
+  - `softmax.cu`：`v1`/`v2`/`v3` 内核注释收敛为指向 `softmax.cuh` 的实现要点，删除与声明 / helper 注释重复的长段说明与误差量级推导（此类内容已在 README），并清理文件尾部杂散空行
+  - 同步 `softmax` 的 `test.cuh` / `test.cu` 注释版本口径：`v0/v1/v2` → `v0/v1/v2/v3`（行映射与 `smem_bytes` 说明补 v3）
+  - 将 v3 开发期临时调试文件 `softmax_v3_test.cu` 自 `src/` 移入 `scratch/`（其自带 `main()`，原会被 `file(GLOB)` 编入 softmax 目标导致链接失败）
 
 ### Added
 
@@ -111,3 +116,11 @@
   - 全量回归 3 内核 × 16 场景 48 项全部通过
   - `operators/softmax/README.md`：状态表 v2 标记完成、原 `float4` 向量化规划顺延为 v3，结论记录表回填同场开发采样（v0 5.2101/3.7837 ms、25.76/35.47 GB/s，v1 0.7149/0.6912 ms、187.74/194.18 GB/s，v2 0.6938/0.6777 ms、193.45/198.05 GB/s，4096×4096 与 16384×1024；v2 max_err 1.232e-06/1.244e-06，同场相对 v1 +3.0%/+2.0%）
   - 顶层 `README.md`：Softmax 状态同步为进行中（v0/v1/v2 完成）
+- 2026-09-09 16:54 `operators/softmax`：新增并接入 `softmax_v3`
+  - `softmax_v3`（v2 + `float4` 向量化）——行映射与两级 warp shuffle 归约同 v2，行内访问按列宽分派：列宽为 4 的倍数（行首 16 B 对齐）时主循环以 stride 取 `float4`（读/写指令数为标量 1/4），否则整行回退 v2 式标量三遍（非 4 倍列宽时跨行行首不对齐，`float4` 属未定义行为，尾列处理救不了跨行对齐），任意列宽均正确
+  - 规整草稿实现为仓库注释风格——补 `row >= M` 越界守卫、修正行和归约误用 `blockReduceMaxShuffle` 为 `blockReduceSumShuffle`、补 ② Σexp 遍累加、移除草稿遗留的 clang 内部头文件 include
+  - 声明加入 `softmax.cuh`（启动约束同 v2：`grid = rows`、blockDim 32 的倍数且 <= 1024、无动态共享内存），`main.cu` 以 `RowMap::kBlockPerRowShuffle` 注册进被测内核表
+  - 边界场景补 float4 对齐边界组（列宽 `4×(block±1)`、`4×block`、`4×(2×block-1)`——向量主循环空转 / 恰 1 轮满载 / 第 2 轮余 1 个与余 `block-1` 个 `float4`）覆盖 v3 向量化路径
+  - 全量回归 4 内核 × 20 场景 80 项全部通过
+  - `operators/softmax/README.md`：状态表 v3 标记完成、原规划段更新为按列宽分派的实现说明，结论记录表刷新为含 v3 的同场开发采样（2026-09-09：v0 5.2876/4.0149 ms、25.38/33.43 GB/s，v1 0.8342/0.8327 ms、160.89/161.18 GB/s，v2 0.7279/0.7163 ms、184.39/187.38 GB/s，v3 0.6904/0.7073 ms、194.41/189.76 GB/s，4096×4096 与 16384×1024；v3 max_err 1.255e-06/1.237e-06，同场相对 v2 +5.4%/+1.3%）
+  - 顶层 `README.md`：Softmax 状态同步为进行中（v0/v1/v2/v3 完成）

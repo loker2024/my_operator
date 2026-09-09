@@ -1,4 +1,4 @@
-// softmax.cu —— softmax.cuh 声明的实现：CPU 参考 + softmax_v0/v1/v2 内核。
+// softmax.cu —— softmax.cuh 声明的实现：CPU 参考 + softmax_v0/v1/v2/v3 内核。
 // 接口契约 / 启动约束 / 版本差异见 softmax.cuh，推导与实测见 README.md。
 
 #include <cmath>    // expf / fmaxf / INFINITY / std::exp
@@ -41,7 +41,7 @@ __global__ void softmax_v0(const float* input, float* output, const int M,
   const float* x = input + row * N;
   float* y = output + row * N;
 
-  // ① 行最大 m（max-shift 使 exp 参数 <= 0、行和 >= 1，数值稳定）
+  // ① 行最大 m（max-shift：exp 参数 <= 0、行和 >= 1，数值稳定）
   float max_val = -INFINITY;
   for (size_t i = 0; i < N; ++i) {
     max_val = fmaxf(max_val, x[i]);
@@ -61,6 +61,7 @@ __global__ void softmax_v0(const float* input, float* output, const int M,
 }
 
 // softmax_v1 —— 每行一个 block，行内协作 + 共享内存树形归约
+// （启动约束与行映射见 softmax.cuh 的 v1 声明）
 __global__ void softmax_v1(const float* input, float* output, const int M,
                            const int N) {
   extern __shared__ float smem[];  // 动态共享内存：blockDim.x * sizeof(float)
@@ -72,8 +73,7 @@ __global__ void softmax_v1(const float* input, float* output, const int M,
   const float* x = input + row * N;
   float* y = output + row * N;
 
-  // ① 各线程 stride 扫行求局部最大 → 折半 fmaxf 树形归约出行最大（warp 内
-  //    同轮访问相邻列 → 读合并；N 不整除 blockDim.x 时多余线程以 -inf 空转）
+  // ① 各线程 stride 扫行求局部最大 → 折半 fmaxf 树形归约出行最大
   float local_max = -INFINITY;
   for (int i = tid; i < N; i += blockDim.x) {
     local_max = fmaxf(local_max, x[i]);
@@ -89,8 +89,7 @@ __global__ void softmax_v1(const float* input, float* output, const int M,
   const float row_max = smem[0];
   __syncthreads();  // 全部线程读走 m 后，smem 才能被 ② 复用
 
-  // ② 同样的 stride 扫行累加局部 Σexp → 树形加法归约出行和（块内分段累加把
-  //    v0 整行串行的舍入误差降到 ~(每线程元素数 + log2(blockDim)) · ulp 量级）
+  // ② 同样的 stride 扫行累加局部 Σexp → 树形加法归约出行和
   float local_sum = 0.0f;
   for (int i = tid; i < N; i += blockDim.x) {
     local_sum += expf(x[i] - row_max);
@@ -105,7 +104,7 @@ __global__ void softmax_v1(const float* input, float* output, const int M,
   }
   const float row_sum = smem[0];
 
-  // ③ 再读一次行重算 exp 并归一化写回（行宽任意，smem 无需装整行）
+  // ③ 第三次读行重算 exp 并归一化写回（smem 只装规约中间量，与行宽无关）
   const float inv_sum = 1.0f / row_sum;
   for (int i = tid; i < N; i += blockDim.x) {
     y[i] = expf(x[i] - row_max) * inv_sum;
@@ -191,15 +190,8 @@ __device__ float blockReduceSumShuffle(float val) {
 // ---------------------------------------------------------------------------
 // softmax_v2 —— 每行一个 block，块内两级 warp shuffle 归约
 // ---------------------------------------------------------------------------
-// 行遍历与 v1 相同（blockDim.x 个线程 stride 扫行 → 全局读合并；N 不足 blockDim.x
-// 时多余线程空转、超出时多轮 stride），差异只在块内归约：v1 的共享内存折半树形
-// 归约换成两级 warp shuffle —— 每 warp 先经 warpReduce{Max,Sum} 归为 1 个值，再由
-// warp 0 归约 num_warps 个值并广播回全体（见上方 helper 注释）。归约在寄存器间
-// 完成、共享内存只做跨 warp 中转，块内同步由 v1 的 ~2×(log2(blockDim.x)+2) 次
-// 降为每个 blockReduce* 内部 2 次 __syncthreads。
-// 启动约束同 v1：row = blockIdx.x、grid = M（M == 0 时也须 >= 1，row >= M 越界
-// 空转）；额外要求 blockDim.x 为 32 的倍数（默认 256）且 <= 1024。无动态共享
-// 内存（仅 helper 内静态 __shared__ 中转，与行宽无关）：smem_bytes = 0。
+// 行映射 / 启动约束见 softmax.cuh 的 v2 声明；与 v1 的差异仅在块内归约：共享
+// 内存折半树换成两级 warp shuffle（结构见上方 blockReduce* helper 注释）。
 __global__ void softmax_v2(const float* input, float* output, const int M,
                            const int N) {
   const int row = blockIdx.x;  // 每 block 处理一行
@@ -217,17 +209,87 @@ __global__ void softmax_v2(const float* input, float* output, const int M,
   }
   const float row_max = blockReduceMaxShuffle(local_max);
 
-  // ② Σexp(x - m)：同样的 stride 扫行分段累加 → 块内归约（块内分段 + 归约累加
-  //    把 v0 整行串行的舍入误差降到 ~(每线程元素数 + log2(blockDim))·ulp 量级）
+  // ② Σexp(x - m)：同样的 stride 扫行分段累加 → 块内归约
   float local_sum = 0.0f;
   for (int i = tid; i < N; i += blockDim.x) {
     local_sum += expf(x[i] - row_max);
   }
   const float row_sum = blockReduceSumShuffle(local_sum);
 
-  // ③ 归一化写回 y = exp(x - m) / 行和（第三次读行重算 exp，行宽任意）
+  // ③ 归一化写回 y = exp(x - m) / 行和（第三次读行重算 exp）
   const float inv_sum = 1.0f / row_sum;
   for (int i = tid; i < N; i += blockDim.x) {
     y[i] = expf(x[i] - row_max) * inv_sum;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// softmax_v3 —— 每行一个 block，v2 行遍历 + float4 向量化（列宽为 4 的倍数时）
+// ---------------------------------------------------------------------------
+// 行映射 / 归约 / 启动约束同 v2，见 softmax.cuh 的 v3 声明（含“非 4 倍列宽为何
+// 整行回退标量”的说明）。实现要点：N % 4 == 0 时行首 16 B 对齐，主循环每轮取
+// 1 个 float4（4 列，读/写指令数为标量 1/4）；否则走 else 分支的 v2 式标量三遍。
+__global__ void softmax_v3(const float* input, float* output, const int M,
+                           const int N) {
+  const int row = blockIdx.x;  // 每 block 处理一行
+  if (row >= M) return;  // 空矩阵 / 超配 grid：越界行空转
+  const int tid = threadIdx.x;
+
+  const float* x = input + row * N;
+  float* y = output + row * N;
+
+  if (N % 4 == 0) {
+    // 列宽为 4 的倍数：行首 16 B 对齐，float4 主循环（每轮 stride 处理 4 列；
+    // 空行 N == 0 时 n4 == 0，各遍循环 0 次、不读不写）
+    const int n4 = N / 4;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* y4 = reinterpret_cast<float4*>(y);
+
+    // ① 行最大 m：float4 各分量逐一 fmaxf（max-shift 使 exp 参数 <= 0）
+    float local_max = -INFINITY;
+    for (int i = tid; i < n4; i += blockDim.x) {
+      local_max = fmaxf(local_max, x4[i].x);
+      local_max = fmaxf(local_max, x4[i].y);
+      local_max = fmaxf(local_max, x4[i].z);
+      local_max = fmaxf(local_max, x4[i].w);
+    }
+    const float row_max = blockReduceMaxShuffle(local_max);
+
+    // ② Σexp(x - m)：同一 float4 的 4 分量一次读出后逐分量累加
+    float local_sum = 0.0f;
+    for (int i = tid; i < n4; i += blockDim.x) {
+      const float4 v = x4[i];
+      local_sum += expf(v.x - row_max) + expf(v.y - row_max) +
+                   expf(v.z - row_max) + expf(v.w - row_max);
+    }
+    const float row_sum = blockReduceSumShuffle(local_sum);
+
+    // ③ 归一化写回：float4 整写（N % 4 == 0，无标量尾部）
+    const float inv_sum = 1.0f / row_sum;
+    for (int i = tid; i < n4; i += blockDim.x) {
+      const float4 v = x4[i];
+      y4[i] = make_float4(expf(v.x - row_max) * inv_sum,
+                          expf(v.y - row_max) * inv_sum,
+                          expf(v.z - row_max) * inv_sum,
+                          expf(v.w - row_max) * inv_sum);
+    }
+  } else {
+    // 列宽非 4 的倍数：行首不保证 16 B 对齐，整行回退标量三遍（语义同 v2）
+    float local_max = -INFINITY;
+    for (int i = tid; i < N; i += blockDim.x) {
+      local_max = fmaxf(local_max, x[i]);
+    }
+    const float row_max = blockReduceMaxShuffle(local_max);
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+      local_sum += expf(x[i] - row_max);
+    }
+    const float row_sum = blockReduceSumShuffle(local_sum);
+
+    const float inv_sum = 1.0f / row_sum;
+    for (int i = tid; i < N; i += blockDim.x) {
+      y[i] = expf(x[i] - row_max) * inv_sum;
+    }
   }
 }

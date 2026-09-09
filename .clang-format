@@ -1,6 +1,9 @@
 # 适用于 CUDA C++（.cu/.cuh/.h/.cpp）的统一样式
 BasedOnStyle: Google
-IndentWidth: 2
+# 缩进固定用真正的 Tab 字符，显示宽度 4（对齐/续行仍由 clang-format 用空格）
+IndentWidth: 4
+TabWidth: 4
+UseTab: ForIndentation
 ColumnLimit: 100
 PointerAlignment: Left
 DerivePointerAlignment: false

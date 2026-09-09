@@ -1,7 +1,7 @@
 // ============================================================================
 // reduce.cu —— reduce.cuh 声明的算子实现（CPU 参考 + GPU 内核 v0…v4、v6、v7）。
 // 接口契约、版本差异与启动约束见 reduce.cuh；详细推导与实测结论见
-// operators/reduce/README.md。此处只保留实现侧的必要说明。
+// operators/reduce/README.md 与 notes/reduce.md。此处只保留实现侧的必要说明。
 // reduce_v5 为模板内核，因实例化点需可见其定义，实现整体内联于 reduce.cuh。
 // ============================================================================
 
@@ -24,9 +24,8 @@ float reduce_cpu(const float* input, int n) {
 // ---------------------------------------------------------------------------
 // reduce_v0 —— 交错寻址树形归约（正确性基线）
 // ---------------------------------------------------------------------------
-// 每线程搬 1 个元素到 smem[tid]（越界 gid >= n 补 0，不影响和）；随后 step 从
-// 1 倍增，满足 tid % (2*step) == 0 的线程把 smem[tid+step] 并入 smem[tid]，
-// log2(blockDim.x) 轮后收敛到 smem[0]，由 tid 0 写入 output[blockIdx.x]。
+// 覆盖口径与启动约束（grid / blockDim.x / 共享内存）见 reduce.cuh 的公共说明
+// 与 v0 声明。实现流程见函数体行内注释。
 __global__ void reduce_v0(const float* input, float* output, int n) {
   extern __shared__ float smem[];
 
@@ -51,9 +50,8 @@ __global__ void reduce_v0(const float* input, float* output, int n) {
 // ---------------------------------------------------------------------------
 // reduce_v1 —— 连续寻址树形归约
 // ---------------------------------------------------------------------------
-// 与 v0 同网格/输出模型，仅把活跃线程从“交错”改为“连续前缀”：每轮
-// index = tid*2*step，index < blockDim.x 时合并 smem[index] += smem[index+step]，
-// 即参与线程为连续前缀，消除 v0 的 warp 内分歧。
+// 与 v0 差异（活跃线程由“交错”改为“连续前缀”）与启动约束见 reduce.cuh 的
+// v1 声明；实现流程见函数体行内注释。
 __global__ void reduce_v1(const float* input, float* output, int n) {
   extern __shared__ float smem[];
 
@@ -79,10 +77,8 @@ __global__ void reduce_v1(const float* input, float* output, int n) {
 // ---------------------------------------------------------------------------
 // reduce_v2 —— 折半步长树形归约
 // ---------------------------------------------------------------------------
-// 步长方向与 v1 相反：stride 自 blockDim.x/2 每轮折半到 1，线程 tid（tid <
-// stride）合并 smem[tid] 与 smem[tid+stride]。部分和就地落回数组最前端的连续
-// 槽，故读写下标在活跃段内连续 → 无共享内存 bank 冲突；活跃线程同为连续前缀，
-// 无 warp 内分歧。
+// 与 v0/v1 差异（步长方向、bank 冲突）与启动约束见 reduce.cuh 的 v2 声明；
+// 实现流程见函数体行内注释。
 __global__ void reduce_v2(const float* input, float* output, int n) {
   extern __shared__ float smem[];
 
@@ -107,10 +103,11 @@ __global__ void reduce_v2(const float* input, float* output, int n) {
 // ---------------------------------------------------------------------------
 // reduce_v3 —— 每线程 2 元素（标量加载）
 // ---------------------------------------------------------------------------
-// 每 block 覆盖 2*blockDim.x 个连续元素：线程 tid 以 gid = blockIdx.x *
-// (2*blockDim.x) + tid 为“段内前半”下标，寄存器预加和 gid 与 gid+blockDim.x
-// 两个元素（越界跳过，等价补 0），再走 v2 的折半步长归约。两次加载在 warp 内
-// 各自连续且互不依赖，可提升内存级并行。grid 口径见 reduce.cuh 的 v3 说明。
+// 覆盖口径（每 block 覆盖 2*blockDim.x 个元素、grid 计算）与启动约束见
+// reduce.cuh 的 v3 声明。实现：线程 tid 以 gid = blockIdx.x * (2*blockDim.x) + tid
+// 为“段内前半”下标，寄存器预加和 gid 与 gid + blockDim.x 两个元素（越界跳过，
+// 等价补 0），再把预加和存进 smem，复用 v2 的折半步长归约。两次加载在 warp 内
+// 各自连续且互不依赖，可提升内存级并行。
 __global__ void reduce_v3(const float* input, float* output, int n) {
   extern __shared__ float smem[];
 
@@ -153,8 +150,9 @@ __device__ void warpReduce(volatile float* smem, int tid) {
 // ---------------------------------------------------------------------------
 // reduce_v4 —— 每线程 2 元素 + 末 warp 展开归约
 // ---------------------------------------------------------------------------
-// 加载与覆盖口径同 v3，仅改归约尾部：折半做到 stride = 32 即停，剩余 5 轮
-// 改由 warp 0 调 warpReduce 展开完成（见其上方注释），省去这些轮次的同步。
+// 加载与覆盖口径同 v3、启动约束见 reduce.cuh 的 v4 声明。实现：折半归约到
+// stride = 32 即停，剩余 5 轮改由 warp 0 调 warpReduce 展开完成（见其上方
+// 注释），省去这些轮次的 __syncthreads。
 __global__ void reduce_v4(const float* input, float* output, int n) {
   extern __shared__ float smem[];
 
@@ -183,12 +181,10 @@ __global__ void reduce_v4(const float* input, float* output, int n) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// reduce_v5 —— 模板常量化版本（实现见 reduce.cuh，含设计说明）
-// ---------------------------------------------------------------------------
-// v5 与 v4 算法一致，仅把 block 尺寸以模板参数常量化、让归约步骤在编译期
-// 整体展开；因 -rdc=false 下跨翻译单元引用 __global__ 模板特化已被 nvcc 弃用，
-// 其模板定义整体内联在 reduce.cuh 中（main.cu 以 reduce_v5<kBlock> 实例化）。
+// reduce_v5 —— 模板常量化版本：与 v4 算法一致，仅把 block 尺寸以模板参数
+// BLOCK_SIZE 常量化、让归约步骤在编译期整体展开。因各实例化点需可见其定义
+// （-rdc=false 下跨翻译单元引用 __global__ 模板特化已被 nvcc 弃用），实现整体
+// 内联于 reduce.cuh（设计说明见其 v5 声明注释）。
 
 // ---------------------------------------------------------------------------
 // warpReduceSum —— 单 warp shuffle 归约（每 lane 1 个局部和 → 全 lane 同值）
@@ -205,11 +201,10 @@ __device__ float warpReduceSum(float val) {
 // ---------------------------------------------------------------------------
 // reduce_v6 —— 每线程 2 元素 + 两级 warp shuffle 归约
 // ---------------------------------------------------------------------------
-// 加载与覆盖口径同 v3/v4/v5（每 block 覆盖 2*blockDim.x 个连续元素），仅把块内
-// 折半树归约换成 warp shuffle：warpReduceSum 先把每 warp 归为 1 个部分和（lane 0
-// 写入 warp_results[wid]），__syncthreads 后 warp 0 再归约 numWarps 个部分和。
-// 约束：blockDim.x 为 2 的幂且 32 <= blockDim.x <= 1024，部分和须装得进
-// warp_results[32]。
+// 加载与覆盖口径同 v3/v4/v5（每 block 覆盖 2*blockDim.x 个元素），块内约束
+// （blockDim.x 为 2 的幂且 32 ~ 1024）见 reduce.cuh 的 v6 声明。实现：每 warp
+// 先经 warpReduceSum 归为 1 个部分和，再由 warp 0 归约 numWarps 个部分和，
+// 见函数体行内注释。
 __global__ void reduce_v6(const float* input, float* output, int n) {
   __shared__ float warp_results[32];  // 各 warp 的部分和
 
@@ -245,17 +240,8 @@ __global__ void reduce_v6(const float* input, float* output, int n) {
 // ---------------------------------------------------------------------------
 // reduce_v7 —— float4 向量化加载 + grid-stride 扫描 + 两级 warp shuffle
 // ---------------------------------------------------------------------------
-// 加载阶段与 v0…v6“每 block 分块连续覆盖”不同：v7 改为 grid-stride 扫描，全体
-// 线程以 total = gridDim.x * blockDim.x 为步长遍历 float4 序列，每轮读入 1 个
-// float4（16 B，input 需 16 字节对齐，cudaMalloc 分配天然满足）并做 4 分量寄存器
-// 累加，全局加载指令数与访存事务约为标量加载的 1/4。n 不是 4 的倍数时，末尾
-// [n4*4, n) 至多 3 个元素由第二个 grid-stride 循环以标量方式补齐。grid-stride
-// 覆盖不依赖 grid 精确配比（任意 grid >= 1 均完整覆盖，冗余 block 不读数据、写
-// 0），为单轮完成推荐的启动网格为 ceil(n / (4*blockDim.x))。
-//
-// 块内归约沿用 v6 的两级 warp shuffle：warpReduceSum 先把每 warp 归为 1 个部分和
-// （lane 0 写入 warp_results[wid]），__syncthreads 后 warp 0 再归约 numWarps 个
-// 部分和。约束同 v6：blockDim.x 为 2 的幂且 32 <= blockDim.x <= 1024。
+// 覆盖口径（grid-stride、对齐要求、启动网格）与启动约束见 reduce.cuh 的 v7
+// 声明；实现结构（float4 主循环 → 尾部标量 → 块内归约）见函数体行内注释。
 __global__ void reduce_v7(const float* input, float* output, int n) {
   const int tid = threadIdx.x;
   const int lane = tid % 32;

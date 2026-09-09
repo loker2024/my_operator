@@ -13,7 +13,7 @@
 
 | 算子 | 说明 | CUDA 核心版 | Triton 版 | 目录 |
 | --- | --- | --- | --- | --- |
-| Softmax | fp32，行主序、逐行归一化 | 进行中（v0/v1/v2 完成） | 规划中 | `operators/softmax` |
+| Softmax | fp32，行主序、逐行归一化 | 进行中（v0/v1/v2/v3 完成） | 规划中 | `operators/softmax` |
 | GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 规划中 | 规划中 | `operators/gemm` |
 | Attention | 单头、fp32、无 mask | 规划中 | 规划中 | `operators/attention` |
 | Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 完成（v0…v7） | 规划中 | `operators/reduce` |
@@ -34,7 +34,7 @@ my_operator/
 │       ├── CpuTimer.h          # CPU 计时（std::chrono）
 │       └── GpuTimer.h          # CUDA 事件计时
 ├── operators/
-│   ├── softmax/                # Softmax：CUDA → Triton（src/ 已创建，v0/v1/v2 完成）
+│   ├── softmax/                # Softmax：CUDA → Triton（src/ 已创建，v0/v1/v2/v3 完成）
 │   │   ├── README.md           # 规划 + 状态 + 结论记录
 │   │   ├── CMakeLists.txt      # 出现 src/main.cu 后自动启用（各算子同一约定）
 │   │   └── src/                # CUDA 实现：softmax.cuh/.cu、test.cuh/.cu、main.cu
