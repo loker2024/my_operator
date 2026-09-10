@@ -1,4 +1,4 @@
-// online_softmax.cu —— online_softmax.cuh 的实现：online_softmax_v0/v1/v2/v3/v3_false
+// online_softmax.cu —— online_softmax.cuh 的实现：online_softmax_v0/v1/v2/v3/v3_false/v4
 //（单趟在线归约）。
 // 接口契约 / 启动约束见 online_softmax.cuh，推导与实测见 README.md。
 
@@ -300,5 +300,64 @@ __global__ void online_softmax_v3_false(const float* input, float* output, const
 	for (int i = tid; i < N; i += blockDim.x) {
 		// 运行期下标：local memory 读，省掉第 2 遍全局读但代价是 L1/显存往返
 		y[i] = expf(reg_cache[count++] - row_max) * inv_sum;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// online_softmax_v4 —— grid-stride 多行处理（块复用）+ 单趟在线归约 + float4
+// ---------------------------------------------------------------------------
+// 行映射 / 启动约束见 online_softmax.cuh 的 v4 声明。行内归约与访存逐项同 online-v2
+// （① 单趟在线归约本线程列子集、两级 warp shuffle 合并出整行 (m, d)；② 第二趟读行
+// 重算 exp(x - m)/d 写回；N % 4 == 0 时两趟都走 float4，否则整行标量），唯一区别在
+// 行映射：每 block 经 grid-stride 循环处理多行，复用同一份寄存器与静态 __shared__
+// （blockReduceOnline 内部的静态中转）。跨行共享内存复用的安全性见 .cuh 声明。
+__global__ void online_softmax_v4(const float* input, float* output, const int M, const int N) {
+	const int tid = threadIdx.x;
+
+	// grid-stride 遍历所有行：每个 block 复用同一份寄存器 / 静态 __shared__ 处理多行
+	for (int row = blockIdx.x; row < M; row += gridDim.x) {
+		const float* x = input + row * N;
+		float* y = output + row * N;
+
+		float m = -INFINITY;
+		float d = 0.0f;
+
+		if (N % 4 == 0) {
+			// 列宽为 4 的倍数：行首 16 B 对齐（row*N 为 4 的倍数），两趟都走 float4；
+			// 空行 N == 0 时 n4 == 0，两趟循环 0 次、不读不写
+			const int n4 = N / 4;
+			const float4* x4 = reinterpret_cast<const float4*>(x);
+			float4* y4 = reinterpret_cast<float4*>(y);
+
+			// ① 一趟 float4 stride 扫行：4 分量逐一插入在线归约 → 块内 shuffle 合并
+			for (int i = tid; i < n4; i += blockDim.x) {
+				const float4 v = x4[i];
+				mergeOnline(m, d, v.x, 1.0f);
+				mergeOnline(m, d, v.y, 1.0f);
+				mergeOnline(m, d, v.z, 1.0f);
+				mergeOnline(m, d, v.w, 1.0f);
+			}
+			blockReduceOnline(m, d);
+
+			// ② 第二趟 float4 读行重算 exp(x - m) / d 并整写回（无标量尾部）
+			const float inv_d = 1.0f / d;
+			for (int i = tid; i < n4; i += blockDim.x) {
+				const float4 v = x4[i];
+				y4[i] = make_float4(expf(v.x - m) * inv_d, expf(v.y - m) * inv_d,
+				                    expf(v.z - m) * inv_d, expf(v.w - m) * inv_d);
+			}
+		} else {
+			// 列宽非 4 的倍数：行首不保证 16 B 对齐，整行回退标量两遍（语义同 online-v1）
+			for (int i = tid; i < N; i += blockDim.x) {
+				mergeOnline(m, d, x[i], 1.0f);  // 插入单元素：该元素自身基准下的分母为 1
+			}
+			blockReduceOnline(m, d);
+
+			// 空行 N == 0：d == 0 → inv_d == inf，但循环 0 次、不写任何元素
+			const float inv_d = 1.0f / d;
+			for (int i = tid; i < N; i += blockDim.x) {
+				y[i] = expf(x[i] - m) * inv_d;
+			}
+		}
 	}
 }

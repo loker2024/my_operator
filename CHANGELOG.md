@@ -47,6 +47,14 @@
 
 ### Added
 
+- 2026-09-10 13:50 `operators/softmax`：新增并接入 `online_softmax_v4`（grid-stride 多行处理 / 块复用 + 单趟在线归约 + float4）
+  - `online_softmax.cu`：新增 v4 内核 —— 行映射由「每行一个 block」改为「每 block 经 grid-stride 循环处理多行」（`for (row = blockIdx.x; row < M; row += gridDim.x)`），复用同一份寄存器与静态 `__shared__`（`blockReduceOnline` 内部中转）；行内归约 / 访存逐项同 online-v2（单趟在线归约 + 两级 warp shuffle 合并、`N % 4 == 0` 时 float4 否则整行标量）；跨行复用共享内存的顺序由 `blockReduceOnline` 收尾 `__syncthreads` 保证，无需在循环末尾额外同步
+  - `online_softmax.cuh`：补 v4 声明与启动约束（grid 由调用方给出、`blockDim.x` 为 32 的倍数且 <= 1024、无动态共享内存、`M == 0` / `N == 0` 空转、非 4 倍列宽整行标量回退），文件头补单元内 v4 说明
+  - `main.cu`：被测内核表注册 `online_softmax_v4`；`RowMap` 新增 `kGridStrideRow`（`grid = min(rows, SM 数 × kGridStrideBlocksPerSm)`，`kGridStrideBlocksPerSm = 32`），`main()` 按当前设备 SM 数初始化该上限并打印；`GridFor` / `SmemFor` / `kBlock` / 边界场景注释同步版本口径
+  - 验证：`nvcc -Xptxas -v` 对 v4 报告 `0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`、`Used 29 registers`；开启 `enable_boundary` 全量回归 12 内核 × 20 场景 **240/240 PASS**（覆盖 `grid = rows` 退化路径、非 4 倍列宽标量回退、空矩阵 / 空行、`N = 0` 等）
+  - 实测（同场开发采样）：v4 与 online-v2 持平（4096² 0.6199 ms / 216.51 GB/s vs 0.6167 ms / 217.64 GB/s；16384×1024 0.6220 ms / 215.78 GB/s vs 0.6156 ms / 218.02 GB/s，`max_err` 逐项相同 1.341e-06 / 1.392e-06）—— 访存受限算子下 block 调度 / 建立开销本就可忽略，「块复用」收益被并行度下降抵消；grid 上限系数 8/32/128 同场对比，32 与 128 在噪声内、8（192 block）宽行掉到 ~197 GB/s
+  - `operators/softmax/README.md`：状态表 / 指标口径 / 版本规划 / 参考规模 / 目录布局与测试 / 场景说明 / 开关说明补 online-v4，并追加 online-v4 与 online-v0/v1/v2/v3/v3_false 同场开发采样与结论
+  - 顶层 `README.md` / `AGENTS.md`：Softmax 状态同步为进行中（v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4 完成，全量回归 240 项通过）
 - 2026-09-10 13:34 `operators/softmax`：新增并接入 `online_softmax_v3_false`（“假寄存器”反面对照，运行期下标缓存被 ptxas 降级为 local memory）
   - `online_softmax.cu`：新增 v3_false 内核 —— 行映射 / 归约 / 启动约束与 online-v3 逐项同构，唯一区别是缓存本线程列时用运行期下标 `reg_cache[count++]`（而非 v3 的编译期常量下标 `reg[k]`）；寄存器不可被运行期索引，ptxas 把该定长数组整体降级为 local memory，写回遍仍免掉第 2 遍全局读。按设计**不做列宽分派、无回退路径**，始终缓存，要求 `ceil(N/blockDim.x) <= kRegTile`（block = 256 时 `N <= 4096`），超过则越界（由调用方保证）
   - `online_softmax.cuh`：补 v3_false 声明与设计说明（与 v3 的对照关系、“假寄存器真 local memory”的成因与判据），文件头补单元内 v3 / v3_false 差异

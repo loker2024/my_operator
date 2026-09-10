@@ -15,7 +15,9 @@
 //   基础上按列宽分派 float4 向量化（仅影响行内访问宽度，归约与启动约束同 v1），
 //   v3 用编译期定长 + 静态下标的寄存器分片缓存省掉第 2 遍全局读，v3_false 是 v3
 //   的反面对照 —— 同样想缓存行，但用运行期下标写入定长数组，被 ptxas 降级为
-//   local memory（“假寄存器”）。
+//   local memory（“假寄存器”）；v4 把「每行一个 block」换成「每 block 经
+//   grid-stride 循环处理多行」（块复用），行内归约 / 向量化同 v2，用于量化
+//   「减少启动 block 数、复用寄存器与静态共享内存」相对「一行一 block」的代价。
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -81,3 +83,23 @@ __global__ void online_softmax_v3(const float* input, float* output, const int M
 //   本版是 v3 的反面对照：与 v3 逐项同构，只差下标是否静态，用于量化「local memory 缓存」
 //   相对「真寄存器缓存」/「重读全局」的代价，实测见 README.md。
 __global__ void online_softmax_v3_false(const float* input, float* output, const int M, const int N);
+
+// online_softmax_v4 grid-stride 多行处理（块复用）+ 全优化集成：行内归约与访存同
+//   online-v2（单趟在线归约 + 两级 warp shuffle 合并、按列宽分派 float4），唯一区别
+//   在行映射 —— 每个 block 经 grid-stride 循环处理**多行**，复用同一份寄存器与静态
+//   __shared__ 连续工作：
+//   * row = blockIdx.x; row < M; row += gridDim.x —— 启动 block 数由调用方给出
+//     （测试中取 min(rows, SM 数 × kGridStrideBlocksPerSm)，见 main.cu）：rows 远大于
+//     该上限时不再启动 rows 个 block，而是让每个 block 顺序处理多行，省掉多余 block
+//     的调度 / 建立开销；
+//   * 行内：① 单趟在线归约本线程列子集（N % 4 == 0 时 float4 主循环、否则标量），
+//     两级 warp shuffle 合并出整行 (m, d)；② 第二趟读行重算 exp(x - m) / d 写回
+//     （全局读 2 遍 + 写 1 遍，exp 每元素 2 次）；
+//   * 启动约束：blockDim.x 为 32 的倍数且 <= 1024（同 online-v1/v2，shuffle 需整 warp
+//     收敛）；无动态共享内存（smem_bytes = 0，内部仅静态 __shared__ 中转）；
+//   * 跨行复用共享内存是安全的：同一 block 内所有线程的行循环 trip count 一致，
+//     blockReduceOnline 的收尾 __syncthreads 已把「上一行读完中转值」排在「下一行
+//     写入中转值」之前，无需在循环末尾额外同步；
+//   * M == 0 时循环 0 次、N == 0 的空行不读不写；列宽非 4 的倍数时整行回退标量
+//     （跨行行首 16 B 不对齐，float4 重解释是未定义行为）。
+__global__ void online_softmax_v4(const float* input, float* output, const int M, const int N);

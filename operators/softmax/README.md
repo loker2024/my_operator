@@ -24,11 +24,12 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
 | CUDA | online-v2 | online-v1 + `float4` 向量化：列宽为 4 的倍数（行首 16 B 对齐）时，单趟在线归约与写回的主循环每轮 stride 取 1 个 `float4`（4 分量逐一 `mergeOnline` / 算 exp 后 16 B 整写回），读/写指令数为标量 1/4；否则整行回退标量 —— 任意列宽均正确 | 完成（已接入测试） |
 | CUDA | online-v3 | 寄存器分片缓存：行映射 / 归约 / 启动约束同 online-v1/v2，每线程元素数 `ceil(N/blockDim.x) <= REG_TILE`（16）时，第 1 遍在线归约的同时把本线程负责的列缓存进**编译期定长、静态下标**的寄存器数组（`#pragma unroll` 整体展开，`ptxas -v` 实测 0 stack frame / 0 spill），写回遍直接取寄存器、省掉第 2 遍全局读；超过分片容量（block=256 时 `N > 4096`）自动回退 online-v1/v2 式两遍重读 —— 任意列宽均正确 | 完成（已接入测试；实测低于 online-v1/v2，见结论记录） |
 | CUDA | online-v3_false | online-v3 的反面对照：行映射 / 归约 / 启动约束同 online-v3，仅把寄存器分片的写法由「编译期定长 + 静态下标 `reg[k]`（真寄存器）」换成「运行期下标 `reg_cache[count++]`」—— 寄存器不可被运行期索引，ptxas 把该定长数组整体降级为 **local memory**（`ptxas -v` 实测 `64 bytes stack frame` = 16 槽 float 数组；数组名叫 reg 但并未落在寄存器，即「假寄存器」）。写回遍同样免掉第 2 遍全局读，代价是每次存取走 local memory（物理显存、仅靠 L1 缓存）。**不做列宽分派、无回退路径**：始终缓存，要求 `ceil(N/blockDim.x) <= 16`（block = 256 时 `N <= 4096`），超过则越界（由调用方保证） | 完成（已接入测试；实测宽行明显领先 online-v3、4096² 基本持平，见结论记录） |
+| CUDA | online-v4 | grid-stride 多行处理（块复用）+ 全优化集成：行映射由「每行一个 block」改为「每 block 经 grid-stride 循环处理多行」（`row = blockIdx.x; row < M; row += gridDim.x`，`grid = min(rows, SM 数 × 32)`），每个 block 复用同一份寄存器 / 静态 `__shared__` 连续处理多行，省掉多余 block 的调度 / 建立开销；行内归约与访存逐项同 online-v2（单趟在线归约 + 两级 warp shuffle 合并、按列宽分派 `float4`） | 完成（已接入测试；实测与 online-v2 持平，见结论记录） |
 | Triton | t0 | 与 CUDA 同规格的 Triton 实现 | 规划中 |
 | Triton | t1 | 与 CUDA 性能对照并记录 | 规划中 |
 
 - 正确性判据：相对误差 ≤ 1e-5（逐元素，跳过 `|ref| < 1e-30` 的元素，见 `docs/benchmark-methodology.md`）。
-- 指标：有效带宽 =（输入读 + 输出写）/ 中位耗时，其中输入输出按**逻辑数据量**各计 1 次（每元素 4 B 读 + 4 B 写）。内核实际可能多次读行（v0 每元素读 3 次、online-v0/v1/v2 读 2 次、online-v3 与 online-v3_false 读 1 次 —— v0 与 online-v0 访存不合并、online-v1/online-v2/online-v3/online-v3_false 合并；v2/v3 读 3 遍、v4 读 1 遍、v5 读 2 遍），低效会直接反映为更低的有效带宽，便于横向比较。
+- 指标：有效带宽 =（输入读 + 输出写）/ 中位耗时，其中输入输出按**逻辑数据量**各计 1 次（每元素 4 B 读 + 4 B 写）。内核实际可能多次读行（v0 每元素读 3 次、online-v0/v1/v2/v4 读 2 次、online-v3 与 online-v3_false 读 1 次 —— v0 与 online-v0 访存不合并、online-v1/online-v2/online-v3/online-v3_false/online-v4 合并；v2/v3 读 3 遍、v4 读 1 遍、v5 读 2 遍），低效会直接反映为更低的有效带宽，便于横向比较。
 
 ## 版本规划说明
 
@@ -152,12 +153,30 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
   202.25 GB/s（差 0.05%，采样波动内）。结论：寄存器分片路线的瓶颈在**寄存器压力**而非读
   行次数 —— v3 的「真寄存器」目标达成，但 63 寄存器带来的占用损失盖过了少读一遍的收益；
   反过来，占用友好的「local memory 缓存」在当前形状下不逊于真寄存器、宽行上更划算。
+- **online-v4 grid-stride 多行处理（块复用）+ 全优化集成（已实现并接入测试）**：把
+  online-v1/v2 的「每行一个 block」换成「每 block 经 grid-stride 循环处理多行」——
+  `for (row = blockIdx.x; row < M; row += gridDim.x)`，启动 block 数取
+  `min(rows, SM 数 × 32)`（`kGridStrideBlocksPerSm`，见 `main.cu`，由设备 SM 数推出、
+  避免硬编码）。`rows` 远大于该上限时不再启动 `rows` 个 block，而是让每个 block 顺序
+  处理多行，复用同一份寄存器与静态 `__shared__`（`blockReduceOnline` 内部中转），
+  省掉多余 block 的调度 / 建立开销；行内归约与访存逐项同 online-v2（① 单趟在线归约 +
+  两级 warp shuffle 合并出整行 `(m, d)`；② 第二趟读行重算 `exp(x - m)/d` 写回；
+  `N % 4 == 0` 时两趟都走 `float4`，否则整行标量）。跨行复用共享内存是安全的：
+  同一 block 内所有线程的行循环 trip count 一致，`blockReduceOnline` 收尾的
+  `__syncthreads` 已把「上一行读完中转值」排在「下一行写入中转值」之前，无需在循环
+  末尾额外同步。启动约束同 online-v1/v2（`blockDim.x` 为 32 的倍数且 <= 1024、无动态
+  共享内存）；`ptxas -v` 实测 `0 bytes stack frame / 0 spill`、`Used 29 registers`。
+  实测（同场开发采样）与 online-v2 基本持平（4096² 216.51 vs 217.64 GB/s，16384×1024
+  215.78 vs 218.02 GB/s，均在采样波动内）—— 该算子是访存受限，block 调度开销本就
+  可忽略，减少 block 数带来的「复用」收益被并行度下降抵消；把上限系数调到 8（192
+  block，更贴近单波驻留）宽行反而掉到 ~197 GB/s，调到 128（3072 block）与 32 在噪声内。
+  结论：grid-stride 是「行数极大时限制 grid」的通用手段，本身不是性能来源。
 
 ## 参考规模
 
 - 默认：`rows=4096, cols=4096`（fp32，约 64 MiB 输入）。
 - 可选：`rows=16384, cols=1024`（宽行场景）。
-- block 大小默认 256（v0 与 online-v0：`grid = ceil(rows/block)`，每线程处理一行；v1/v2/v3/v4/v5 与 online-v1/online-v2/online-v3/online-v3_false：`grid = rows`，行内由 256 个线程协作；v2/v3/v4/v5 与 online-v1/online-v2/online-v3/online-v3_false 另要求 32 的倍数且 <= 1024；v4/v5 额外要求动态共享内存 `N * sizeof(float)` 不超上限，见状态表与版本规划）。
+- block 大小默认 256（v0 与 online-v0：`grid = ceil(rows/block)`，每线程处理一行；v1/v2/v3/v4/v5 与 online-v1/online-v2/online-v3/online-v3_false：`grid = rows`，行内由 256 个线程协作；online-v4：`grid = min(rows, SM 数 × 32)`、每 block 经 grid-stride 循环处理多行；v2/v3/v4/v5 与 online-v1/online-v2/online-v3/online-v3_false/online-v4 另要求 32 的倍数且 <= 1024；v4/v5 额外要求动态共享内存 `N * sizeof(float)` 不超上限，见状态表与版本规划）。
 
 ## 目录布局与测试
 
@@ -165,18 +184,19 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
 softmax/
 ├── README.md   # 本文档：规划 + 结论总表
 ├── CMakeLists.txt  # 构建脚本（src/main.cu 存在即自动启用）
-└── src/        # CUDA 实现（当前 v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false，后续版本追加进对应 .cuh/.cu）
+└── src/        # CUDA 实现（当前 v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4，后续版本追加进对应 .cuh/.cu）
     ├── softmax.cuh / softmax.cu   # 算子接口与实现：v0~v5（被测试对象）
-    ├── online_softmax.cuh / .cu   # 独立实现单元：online softmax 单趟在线归约（online-v0/v1/v2/v3/v3_false）
+    ├── online_softmax.cuh / .cu   # 独立实现单元：online softmax 单趟在线归约（online-v0/v1/v2/v3/v3_false/v4）
     ├── test.cuh  / test.cu        # 可复用测试驱动：正确性(容差1e-5)+性能
-    └── main.cu                    # 执行入口：注册 v0~v5 与 online-v0/v1/v2/v3/v3_false，运行测试
+    └── main.cu                    # 执行入口：注册 v0~v5 与 online-v0/v1/v2/v3/v3_false/v4，运行测试
 ```
 
 > 注：`triton/` 与 `notes/` 属规划目录，尚未创建。
 
 测试入口 `src/main.cu` 将 `softmax_v0` ~ `softmax_v5` 与 `online_softmax_v0` /
-`online_softmax_v1` / `online_softmax_v2` / `online_softmax_v3` / `online_softmax_v3_false`
-注册给同一测试驱动（`online_softmax_v0` / `v1` / `v2` / `v3` / `v3_false` 为独立实现单元，
+`online_softmax_v1` / `online_softmax_v2` / `online_softmax_v3` / `online_softmax_v3_false` /
+`online_softmax_v4`
+注册给同一测试驱动（`online_softmax_v0` / `v1` / `v2` / `v3` / `v3_false` / `v4` 为独立实现单元，
 见 `online_softmax.cuh`）。
 因各版行映射与共享内存不同，`main.cu` 以 `RowMap` 描述各内核并按场景推出
 启动配置（见 `softmax.cuh` / `online_softmax.cuh` 各版本声明）：v0 每线程处理一行 →
@@ -189,7 +209,9 @@ online-v3/online-v3_false 每行一个 block → 与 v2/v3 同为
 `RowMap::kBlockPerRowShuffle`（`grid = rows`、无动态共享内存，内部仅静态 `__shared__`
 中转；online-v2 的 `float4` 向量化只影响行内访问，启动配置同 online-v1；online-v3 与
 online-v3_false 的寄存器 / local memory 分片缓存只影响写回遍的 x 来源，启动配置亦同
-online-v1）；v4/v5 每行一个 block →
+online-v1）；online-v4 每 block 经 grid-stride 循环处理多行 →
+`RowMap::kGridStrideRow`（`grid = min(rows, SM 数 × 32)`、无动态共享内存 —— 内部仅静态
+`__shared__` 中转，`float4` 向量化只影响行内访问）；v4/v5 每行一个 block →
 `grid = rows`、动态共享内存 `cols * sizeof(float)`（随列宽增长，`main.cu` 的 `SmemFor`
 需按列宽传入 —— v4 缓存整行 x、v5 缓存整行 exp）。
 每内核覆盖三类场景：
@@ -198,22 +220,25 @@ online-v1）；v4/v5 每行一个 block →
 - **边界条件**：`1×1`，行数在 block 线程覆盖边界附近的 `(block±1)`、恰满载的
   `block`、末 block 仅余 1 行的 `(2*block-1)`（v0 与 online-v0 的关键路径，列宽 3），以及行宽在
   行内协作边界附近的 `3×(block±1)`、恰 1 轮满载的 `3×block`、第 2 轮仅余 1 列的
-  `3×(2*block-1)`、warp 边界附近的 `3×(32±1)` / `3×32`（v2/v3/v4/v5 与 online-v1/online-v2 的
+  `3×(2*block-1)`、warp 边界附近的 `3×(32±1)` / `3×32`（v2/v3/v4/v5 与 online-v1/online-v2/online-v4 的
   关键路径
   —— 覆盖
   空转线程、多轮 stride 与整 warp 空转的归约单位元路径，online-v1 在此走「空子集
   `(m = -inf, d = 0)` 参与二元组合并」的路径；其中非 4 倍列宽场景对
-  v3/v4/v5 与 online-v2 走标量回退），以及 float4 对齐边界 `3×[4×(block±1)]` / `3×(4×block)` /
-  `3×[4×(2*block-1)]`（v3/v4/v5 与 online-v2 向量化主循环在 block 线程数附近 —— 空转 / 恰 1 轮
+  v3/v4/v5 与 online-v2/online-v4 走标量回退），以及 float4 对齐边界 `3×[4×(block±1)]` / `3×(4×block)` /
+  `3×[4×(2*block-1)]`（v3/v4/v5 与 online-v2/online-v4 向量化主循环在 block 线程数附近 —— 空转 / 恰 1 轮
   满载 /
-  第 2 轮余 1 个 / 余 `block-1` 个 `float4`，列宽均为 4 的倍数）；
+  第 2 轮余 1 个 / 余 `block-1` 个 `float4`，列宽均为 4 的倍数）；其中行数边界组
+  （行数 ≤ `2*block` < grid-stride 上限）对 online-v4 走「`grid = rows`、一行一 block」
+  的退化路径，grid-stride「同一 block 处理多行」路径由正常流程组（rows 4096 / 16384 >
+  上限）覆盖；
 - **异常 / 健壮性**：`0×1024` 空矩阵（越界空转）、`3×0` 空行（遍历 0 次、不写）。
 
 开关（均为 `RunScenarios` 的函数参数，**默认关闭**，在 `main()` 中集中设置）：
 
 | 开关 | 默认 | 作用 |
 | --- | --- | --- |
-| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（10 内核共 200 项） |
+| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（12 内核共 240 项） |
 | `strict_benchmark` | `false` | 是否按严格口径采样（透传给 `test_softmax_kernel` 的同名参数，与 reduce 测试一致）：关闭时 1 次预热 + 100 次迭代；开启时 100 次预热 + 21 组 × 1000 次并输出 P5/P95 |
 
 日常开发保持默认即可（只跑有性能意义的大规模形状）；出严格基准数字或做全量
@@ -411,3 +436,38 @@ v0–v5 逐项横比（同机同构建，单次采样波动约 ±10%）：
 缓存（v3_false）反而更划算。两者共同指向：要真正兑现少读一遍的收益，需按列宽分列
 实例化以同时压低寄存器数与无效展开（v3 路线），或接受 local memory 由 L1 兜底
 （v3_false 路线）。
+
+### online-v4 grid-stride 多行处理开发采样（2026-09-10）
+
+`online_softmax_v4` 与 online-v0/v1/v2/v3/v3_false **同一次开发采样**（默认档：1 次
+预热 + 100 次迭代，`strict_benchmark=false`，2026-09-10 运行）。`online-v4` 启动
+grid = min(rows, 24 SM × 32) = 768（4096×4096 每 block 约 5.3 行、16384×1024 约 21.3 行）：
+
+| 内核 | 4096×4096 ms | GB/s | 16384×1024 ms | GB/s | max_err (4096² / 16384×1024) | 寄存器 |
+| --- | --- | --- | --- | --- | --- | --- |
+| online-v0 | 3.3967 | 39.51 | 3.1184 | 43.04 | 5.488e-06 / 2.884e-06 | 38 |
+| online-v1 | 0.6636 | 202.25 | 0.6961 | 192.83 | 1.329e-06 / 1.285e-06 | 20 |
+| online-v2 | 0.6167 | 217.64 | 0.6156 | 218.02 | 1.341e-06 / 1.392e-06 | 24 |
+| online-v3 | 0.6824 | 196.70 | 0.9863 | 136.09 | 1.329e-06 / 1.285e-06 | 61 |
+| online-v3_false | 0.6520 | 205.87 | 0.6993 | 191.93 | 1.329e-06 / 1.285e-06 | 20 |
+| online-v4 | 0.6199 | 216.51 | 0.6220 | 215.78 | 1.341e-06 / 1.392e-06 | 29 |
+
+要点：
+
+1. **正确性与 online-v2 逐项一致**：`max_err` 完全相同（1.341e-06 / 1.392e-06）——
+   行内 `(m, d)` 在线归约路径一模一样，online-v4 只把行映射换成 grid-stride 循环。
+   开启 `enable_boundary` 全量回归 12 内核 × 20 场景 **240/240 PASS**，覆盖
+   `grid = rows` 退化路径、非 4 倍列宽标量回退、空矩阵 / 空行、`N=0` 等路径。
+2. **性能与 online-v2 持平**：4096² 216.51 vs 217.64 GB/s（−0.5%）、16384×1024
+   215.78 vs 218.02 GB/s（−1.0%），均在单次采样波动（约 ±5~10%）内。
+3. **grid 上限系数不敏感**：把 `kGridStrideBlocksPerSm` 由 32 调到 128（3072 block）
+   同场 4096² ~219 / 16384×1024 ~203–220 GB/s，与 32 在噪声内；调到 8（192 block，
+   更贴近单波驻留）宽行掉到 ~197 GB/s —— block 数过少、并行度不足以隐藏访存延迟。
+4. **`ptxas -v`**：online-v4 `0 bytes stack frame / 0 spill`、`Used 29 registers`
+   （online-v2 为 24、online-v1 为 20），占用不构成新瓶颈。
+
+结论：该算子是**访存受限**，block 调度 / 建立开销本就可忽略 —— 减少启动 block 数、
+让每个 block 复用寄存器与共享内存连续处理多行，收益被并行度下降抵消，故 grid-stride
+在本算子当前形状下**不构成性能来源**。其价值在通用性：`rows` 极大（如百万行）时可用
+固定上限的 grid 启动而无需启动 `rows` 个 block；这也是仓库 reduce-v7 用 grid-stride
+扫描的同一动机。
