@@ -51,8 +51,7 @@ void softmax_cpu(const float* input, float* output, int M, int N);
 //   * grid = ceil(M / blockDim.x)（M == 0 时也须 >= 1，由 row >= M 越界空转）；
 //   * 无共享内存 / 同步（动态共享内存 = 0）。Σexp 为 fp32 串行累加，舍入误差
 //     随行宽增长，是 v1 树形归约要解决的问题。
-__global__ void softmax_v0(const float* input, float* output, const int M,
-                           const int N);
+__global__ void softmax_v0(const float* input, float* output, const int M, const int N);
 
 // v1 每行一个 block，行内列维由 blockDim.x 个线程以 stride = blockDim.x 协同
 //   遍历三次：行最大与行和各经一次共享内存折半树形归约，写回时第三次读行重算
@@ -62,8 +61,7 @@ __global__ void softmax_v0(const float* input, float* output, const int M,
 //     空转（不影响结果，-inf/0 为归约单位元）；N 超过 blockDim.x 时多轮 stride；
 //   * 动态共享内存 = blockDim.x * sizeof(float)（只装规约中间量，与行宽无关）；
 //   * blockDim.x 应为 2 的幂（默认 256），保证折半归约各轮均匀配对。
-__global__ void softmax_v1(const float* input, float* output, const int M,
-                           const int N);
+__global__ void softmax_v1(const float* input, float* output, const int M, const int N);
 
 // v2 每行一个 block，行内遍历与归约语义同 v1（三次 stride 扫行），仅把共享内存
 //   折半树形归约换成两级 warp shuffle（helper 与实现见 softmax.cu）：
@@ -73,8 +71,7 @@ __global__ void softmax_v1(const float* input, float* output, const int M,
 //     装进归约中转的 warp_results[32]；
 //   * 无动态共享内存（内部仅静态 __shared__ 做跨 warp 中转，与行宽无关）：
 //     启动配置的 smem_bytes = 0。
-__global__ void softmax_v2(const float* input, float* output, const int M,
-                           const int N);
+__global__ void softmax_v2(const float* input, float* output, const int M, const int N);
 
 // v3 行遍历与归约同 v2（每行一个 block、两级 warp shuffle、无动态共享内存），
 //   行内访问按列宽分派以支持任意列宽：
@@ -85,8 +82,7 @@ __global__ void softmax_v2(const float* input, float* output, const int M,
 //     影响，仅无向量化收益）；
 //   * 启动约束同 v2：row = blockIdx.x、grid = M、blockDim.x 为 32 的倍数（默认
 //     256）且 <= 1024；smem_bytes = 0。
-__global__ void softmax_v3(const float* input, float* output, const int M,
-                           const int N);
+__global__ void softmax_v3(const float* input, float* output, const int M, const int N);
 
 // v4 每行一个 block，行内遍历改“整行缓存一遍读”（行映射 / 两级 warp shuffle
 //   归约 / 按列宽分派同 v2/v3 框架）：
@@ -99,8 +95,7 @@ __global__ void softmax_v3(const float* input, float* output, const int M,
 //     （默认 256）且 <= 1024；额外要求 N * sizeof(float) <= 每 block 动态共享
 //     内存上限（默认 48 KiB 内免 opt-in，如 N = 4096 需 16 KiB；更大行宽须以
 //     cudaFuncSetAttribute 提额）。N == 0 时空转，smem_bytes = 0 即可。
-__global__ void softmax_v4(const float* input, float* output, const int M,
-                           const int N);
+__global__ void softmax_v4(const float* input, float* output, const int M, const int N);
 
 // v5 每行一个 block，行内遍历改“全局读 2 遍 + float4”（v4 前身思路原样接入）：
 //   * 与 v4 同为“共享内存缓存整行”，但缓存内容从 x 换成 exp：① 全局 float4 读 1
@@ -110,8 +105,7 @@ __global__ void softmax_v4(const float* input, float* output, const int M,
 //     smem 的写 + 读往返”（v4 的 smem 流量为 v5 的两倍），全局读带宽富余时更划算；
 //   * 动态共享内存 = N * sizeof(float)（只装整行 exp，启动约束与上限同 v4 声明）；
 //     列宽为 4 的倍数时 ①②③ 全走 float4，否则整行回退标量；N == 0 时空转。
-__global__ void softmax_v5(const float* input, float* output, const int M,
-                           const int N);
+__global__ void softmax_v5(const float* input, float* output, const int M, const int N);
 
 // ---------------------------------------------------------------------------
 // softmax 内核统一签名（仅输出约定一致；启动配置随内核版本由 main.cu 给出）

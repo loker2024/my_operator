@@ -22,5 +22,5 @@
 //                        true 时 1000 次预热 + 21 组 × 10000 次并输出 P5/P95
 //
 // 返回：正确性通过返回 true（供 main 汇总并决定退出码）。
-bool test_reduce_kernel(ReduceKernel kernel, const char* kernel_name, int n,
-                        int grid, int block, bool strict_benchmark = false);
+bool test_reduce_kernel(ReduceKernel kernel, const char* kernel_name, int n, int grid, int block,
+                        bool strict_benchmark = false);

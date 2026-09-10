@@ -14,9 +14,9 @@
 #include <cstddef>  // std::size_t
 #include <cstdio>   // printf / std::snprintf
 
+#include "operator_common/cuda_check.h"
 #include "reduce.cuh"
 #include "test.cuh"
-#include "operator_common/cuda_check.h"
 
 namespace {
 
@@ -30,9 +30,9 @@ constexpr int kBlock = 256;
 // grid 再减半），GridFor 据此计算。v7 为 grid-stride 扫描，任意 grid >= 1 都完整
 // 覆盖输入，该值只用于给出“多数线程单轮完成”的推荐网格。
 struct KernelEntry {
-  const char* name;           // 打印用名字
-  ReduceKernel kernel;        // 内核函数指针
-  int elems_per_thread;       // 每线程加载的元素数
+	const char* name;      // 打印用名字
+	ReduceKernel kernel;   // 内核函数指针
+	int elems_per_thread;  // 每线程加载的元素数
 };
 
 const KernelEntry kKernels[] = {
@@ -49,14 +49,14 @@ const KernelEntry kKernels[] = {
 // 测试场景。label 仅用于打印；n 为输入元素个数；extra_grid 为在“恰好覆盖 n 的
 // block 数”基础上额外多配的 block 数（验证“超配安全”）。
 struct Scenario {
-  const char* label;
-  int n;
-  int extra_grid;
+	const char* label;
+	int n;
+	int extra_grid;
 };
 
 template <size_t N>
 constexpr size_t CountOf(const Scenario (&)[N]) {
-  return N;
+	return N;
 }
 
 // 由场景求实际启动的 grid：
@@ -66,10 +66,10 @@ constexpr size_t CountOf(const Scenario (&)[N]) {
 // 对 v7（grid-stride 扫描）该值为“推荐网格”而非“精确覆盖所需”：其循环按
 // gridDim 联合步进，grid >= 1 即完整覆盖，超出部分只空转（写 0），仍安全。
 int GridFor(int n, int block, int elems_per_thread, int extra_grid) {
-  const int span = block * elems_per_thread;
-  int base = (n + span - 1) / span;
-  if (base < 1) base = 1;
-  return base + extra_grid;
+	const int span = block * elems_per_thread;
+	int base = (n + span - 1) / span;
+	if (base < 1) base = 1;
+	return base + extra_grid;
 }
 
 // 场景组 A：正常流程 —— 大规模形状（grid 恰好覆盖输入）。
@@ -101,73 +101,70 @@ const Scenario kAbnormalScenarios[] = {
 // 开关：enable_boundary 执行 B/C 组（默认只跑 A 组正常流程，避免极小形状拖慢
 // 日常迭代）；strict_benchmark 透传给 test_reduce_kernel 的严格采样口径。
 bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
-                  bool strict_benchmark = false, int* passed = nullptr,
-                  int* total = nullptr) {
-  bool all_ok = true;
-  int local_passed = 0;
-  int local_total = 0;
+                  bool strict_benchmark = false, int* passed = nullptr, int* total = nullptr) {
+	bool all_ok = true;
+	int local_passed = 0;
+	int local_total = 0;
 
-  const auto run_group = [&](const char* title, const Scenario* scenarios, size_t count) {
-    std::printf("== %s ==\n", title);
-    for (size_t i = 0; i < count; ++i) {
-      const Scenario& s = scenarios[i];
-      char full_name[192];
-      std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
-      const bool ok = test_reduce_kernel(kern.kernel, full_name, s.n,
-                                         GridFor(s.n, kBlock, kern.elems_per_thread,
-                                                 s.extra_grid),
-                                         kBlock, strict_benchmark);
-      all_ok = ok && all_ok;
-      local_passed += ok ? 1 : 0;
-      local_total += 1;
-    }
-  };
+	const auto run_group = [&](const char* title, const Scenario* scenarios, size_t count) {
+		std::printf("== %s ==\n", title);
+		for (size_t i = 0; i < count; ++i) {
+			const Scenario& s = scenarios[i];
+			char full_name[192];
+			std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
+			const bool ok =
+			    test_reduce_kernel(kern.kernel, full_name, s.n,
+			                       GridFor(s.n, kBlock, kern.elems_per_thread, s.extra_grid),
+			                       kBlock, strict_benchmark);
+			all_ok = ok && all_ok;
+			local_passed += ok ? 1 : 0;
+			local_total += 1;
+		}
+	};
 
-  run_group("[A] 正常流程", kNormalScenarios, CountOf(kNormalScenarios));
-  if (enable_boundary) {
-    run_group("[B] 边界条件", kBoundaryScenarios, CountOf(kBoundaryScenarios));
-    run_group("[C] 异常与健壮性", kAbnormalScenarios, CountOf(kAbnormalScenarios));
-  } else {
-    std::printf("== [B] 边界条件 / [C] 异常与健壮性 ==\n");
-    std::printf("    已跳过（enable_boundary = false，默认关闭）\n");
-  }
+	run_group("[A] 正常流程", kNormalScenarios, CountOf(kNormalScenarios));
+	if (enable_boundary) {
+		run_group("[B] 边界条件", kBoundaryScenarios, CountOf(kBoundaryScenarios));
+		run_group("[C] 异常与健壮性", kAbnormalScenarios, CountOf(kAbnormalScenarios));
+	} else {
+		std::printf("== [B] 边界条件 / [C] 异常与健壮性 ==\n");
+		std::printf("    已跳过（enable_boundary = false，默认关闭）\n");
+	}
 
-  if (passed != nullptr) *passed += local_passed;
-  if (total != nullptr) *total += local_total;
-  return all_ok;
+	if (passed != nullptr) *passed += local_passed;
+	if (total != nullptr) *total += local_total;
+	return all_ok;
 }
 
 }  // namespace
 
 int main() {
-  // 开关集中在此，默认关闭：只跑正常流程 + 快速性能。需要全量回归或严格基准时
-  // 改为 true。
-  constexpr bool kEnableBoundary = false;
-  constexpr bool kStrictBenchmark = false;
+	// 开关集中在此，默认关闭：只跑正常流程 + 快速性能。需要全量回归或严格基准时
+	// 改为 true。
+	constexpr bool kEnableBoundary = false;
+	constexpr bool kStrictBenchmark = false;
 
-  PrintDeviceInfo();
-  std::printf("\n");
+	PrintDeviceInfo();
+	std::printf("\n");
 
-  std::printf("==== Reduce 测试：正确性(容差 1e-3) + 性能 ====\n");
-  std::printf("block = %d；被测内核 %zu 个\n", kBlock,
-              sizeof(kKernels) / sizeof(kKernels[0]));
-  std::printf("开关: enable_boundary = %s, strict_benchmark = %s\n\n",
-              kEnableBoundary ? "true" : "false",
-              kStrictBenchmark ? "true" : "false");
+	std::printf("==== Reduce 测试：正确性(容差 1e-3) + 性能 ====\n");
+	std::printf("block = %d；被测内核 %zu 个\n", kBlock, sizeof(kKernels) / sizeof(kKernels[0]));
+	std::printf("开关: enable_boundary = %s, strict_benchmark = %s\n\n",
+	            kEnableBoundary ? "true" : "false", kStrictBenchmark ? "true" : "false");
 
-  bool all_ok = true;
-  int passed = 0;
-  int total = 0;
+	bool all_ok = true;
+	int passed = 0;
+	int total = 0;
 
-  for (const KernelEntry& kern : kKernels) {
-    std::printf("---------------- %s ----------------\n", kern.name);
-    const bool ok = RunScenarios(kern, kEnableBoundary, kStrictBenchmark, &passed, &total);
-    all_ok = ok && all_ok;
-    std::printf("\n");
-  }
+	for (const KernelEntry& kern : kKernels) {
+		std::printf("---------------- %s ----------------\n", kern.name);
+		const bool ok = RunScenarios(kern, kEnableBoundary, kStrictBenchmark, &passed, &total);
+		all_ok = ok && all_ok;
+		std::printf("\n");
+	}
 
-  // 正确性全部通过则退出码 0，否则 1（便于脚本化判断）。
-  std::printf("==== 结果：%d/%d 项 PASS，%s ====\n", passed, total,
-              all_ok ? "全部通过" : "存在 FAIL");
-  return all_ok ? 0 : 1;
+	// 正确性全部通过则退出码 0，否则 1（便于脚本化判断）。
+	std::printf("==== 结果：%d/%d 项 PASS，%s ====\n", passed, total,
+	            all_ok ? "全部通过" : "存在 FAIL");
+	return all_ok ? 0 : 1;
 }

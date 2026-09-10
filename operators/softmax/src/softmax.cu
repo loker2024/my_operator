@@ -1,7 +1,6 @@
 // softmax.cu —— softmax.cuh 声明的实现：CPU 参考 + softmax_v0/v1/v2/v3/v4/v5 内核。
 // 接口契约 / 启动约束 / 版本差异见 softmax.cuh，推导与实测见 README.md。
 
-
 #include <cmath>    // expf / fmaxf / INFINITY / std::exp
 #include <cstddef>  // std::size_t
 
@@ -421,8 +420,7 @@ __global__ void softmax_v5(const float* input, float* output, const int M, const
 		const float inv_sum = 1.0f / row_sum;
 		for (int i = tid; i < n4; i += blockDim.x) {
 			const float4 e = smem4[i];
-			y4[i] = make_float4(e.x * inv_sum, e.y * inv_sum, e.z * inv_sum,
-			                    e.w * inv_sum);
+			y4[i] = make_float4(e.x * inv_sum, e.y * inv_sum, e.z * inv_sum, e.w * inv_sum);
 		}
 	} else {
 		// 列宽非 4 的倍数：行首不保证 16 B 对齐，①/②/③ 整行回退标量（语义同 v2）

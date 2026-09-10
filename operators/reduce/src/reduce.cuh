@@ -70,48 +70,48 @@ __global__ void reduce_v4(const float* input, float* output, int n);
 //   reduce_v5<256> 实例（与 main.cu 的 kBlock = 256 对应）作函数指针。
 template <int BLOCK_SIZE>
 __global__ void reduce_v5(const float* input, float* output, int n) {
-  extern __shared__ float smem[];
+	extern __shared__ float smem[];
 
-  const int tid = threadIdx.x;
-  const int gid = blockIdx.x * (2 * BLOCK_SIZE) + threadIdx.x;
+	const int tid = threadIdx.x;
+	const int gid = blockIdx.x * (2 * BLOCK_SIZE) + threadIdx.x;
 
-  // 每线程预加和相距 BLOCK_SIZE 的两个元素（越界跳过，等价补 0）。
-  float val = 0.0f;
-  if (gid < n) val += input[gid];
-  if (gid + BLOCK_SIZE < n) val += input[gid + BLOCK_SIZE];
-  smem[tid] = val;
-  __syncthreads();
+	// 每线程预加和相距 BLOCK_SIZE 的两个元素（越界跳过，等价补 0）。
+	float val = 0.0f;
+	if (gid < n) val += input[gid];
+	if (gid + BLOCK_SIZE < n) val += input[gid + BLOCK_SIZE];
+	smem[tid] = val;
+	__syncthreads();
 
-  // 编译期常量归约级：每级把部分和数量折半、就地落回 smem 前端连续槽（无
-  // bank 冲突，同 v2 说明）；BLOCK_SIZE 已知使未命中的整级分支可被消除。
-  if (BLOCK_SIZE >= 512) {
-    if (tid < 256) smem[tid] += smem[tid + 256];  // 512 -> 256 个部分和
-    __syncthreads();
-  }
-  if (BLOCK_SIZE >= 256) {
-    if (tid < 128) smem[tid] += smem[tid + 128];  // 256 -> 128
-    __syncthreads();
-  }
-  if (BLOCK_SIZE >= 128) {
-    if (tid < 64) smem[tid] += smem[tid + 64];  // 128 -> 64
-    __syncthreads();
-  }
+	// 编译期常量归约级：每级把部分和数量折半、就地落回 smem 前端连续槽（无
+	// bank 冲突，同 v2 说明）；BLOCK_SIZE 已知使未命中的整级分支可被消除。
+	if (BLOCK_SIZE >= 512) {
+		if (tid < 256) smem[tid] += smem[tid + 256];  // 512 -> 256 个部分和
+		__syncthreads();
+	}
+	if (BLOCK_SIZE >= 256) {
+		if (tid < 128) smem[tid] += smem[tid + 128];  // 256 -> 128
+		__syncthreads();
+	}
+	if (BLOCK_SIZE >= 128) {
+		if (tid < 64) smem[tid] += smem[tid + 64];  // 128 -> 64
+		__syncthreads();
+	}
 
-  // 剩余 <= 64 个部分和收进 warp 0 展开合并（volatile 保证每次读写真实落内存，
-  // 免去其后所有 __syncthreads，语义与实现细节同 reduce.cu 的 warpReduce 注释）。
-  if (tid < 32) {
-    volatile float* vsmem = smem;
-    if (BLOCK_SIZE >= 64) vsmem[tid] += vsmem[tid + 32];  // 64 -> 32
-    vsmem[tid] += vsmem[tid + 16];
-    vsmem[tid] += vsmem[tid + 8];
-    vsmem[tid] += vsmem[tid + 4];
-    vsmem[tid] += vsmem[tid + 2];
-    vsmem[tid] += vsmem[tid + 1];
-  }
+	// 剩余 <= 64 个部分和收进 warp 0 展开合并（volatile 保证每次读写真实落内存，
+	// 免去其后所有 __syncthreads，语义与实现细节同 reduce.cu 的 warpReduce 注释）。
+	if (tid < 32) {
+		volatile float* vsmem = smem;
+		if (BLOCK_SIZE >= 64) vsmem[tid] += vsmem[tid + 32];  // 64 -> 32
+		vsmem[tid] += vsmem[tid + 16];
+		vsmem[tid] += vsmem[tid + 8];
+		vsmem[tid] += vsmem[tid + 4];
+		vsmem[tid] += vsmem[tid + 2];
+		vsmem[tid] += vsmem[tid + 1];
+	}
 
-  if (tid == 0) {
-    output[blockIdx.x] = smem[0];
-  }
+	if (tid == 0) {
+		output[blockIdx.x] = smem[0];
+	}
 }
 
 // v6 见 reduce.cu：两级 warp shuffle 归约版，覆盖口径同 v3/v4/v5，要求

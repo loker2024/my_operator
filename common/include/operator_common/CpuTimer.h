@@ -5,17 +5,16 @@
 #include <chrono>
 
 class CpuTimer {
- public:
-  // 记录起始点。
-  void Start() { start_ = std::chrono::steady_clock::now(); }
+   public:
+	// 记录起始点。
+	void Start() { start_ = std::chrono::steady_clock::now(); }
 
-  // 返回自 Start 起的耗时（毫秒）。仅读取一次时钟，不阻塞、不重置。
-  float StopMs() {
-    return std::chrono::duration<float, std::milli>(
-               std::chrono::steady_clock::now() - start_)
-        .count();
-  }
+	// 返回自 Start 起的耗时（毫秒）。仅读取一次时钟，不阻塞、不重置。
+	float StopMs() {
+		return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start_)
+		    .count();
+	}
 
- private:
-  std::chrono::steady_clock::time_point start_{};
+   private:
+	std::chrono::steady_clock::time_point start_{};
 };

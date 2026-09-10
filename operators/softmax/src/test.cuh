@@ -32,6 +32,6 @@
 //                         true 时 1000 次预热 + 21 组 × 10000 次并输出 P5/P95
 //
 // 返回：正确性通过返回 true（供 main 汇总并决定退出码）。
-bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows,
-                         int cols, int grid, int block, std::size_t smem_bytes,
+bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows, int cols,
+                         int grid, int block, std::size_t smem_bytes,
                          bool strict_benchmark = false);

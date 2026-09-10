@@ -22,9 +22,32 @@
   - `softmax.cu`：`v1`/`v2`/`v3` 内核注释收敛为指向 `softmax.cuh` 的实现要点，删除与声明 / helper 注释重复的长段说明与误差量级推导（此类内容已在 README），并清理文件尾部杂散空行
   - 同步 `softmax` 的 `test.cuh` / `test.cu` 注释版本口径：`v0/v1/v2` → `v0/v1/v2/v3`（行映射与 `smem_bytes` 说明补 v3）
   - 将 v3 开发期临时调试文件 `softmax_v3_test.cu` 自 `src/` 移入 `scratch/`（其自带 `main()`，原会被 `file(GLOB)` 编入 softmax 目标导致链接失败）
+- 2026-09-10 09:46 按 AGENTS.md 注释 `online_softmax` 并以实际代码校正启动配置与文档
+  - `online_softmax.cuh` / `.cu`：补模块 / 函数 / 启动约束 / 注意事项注释（行映射 `row = blockIdx.x * blockDim.x + threadIdx.x`、`grid = ceil(M/blockDim.x)`、无共享内存、`N == 0` 空行不读不写），推导细节留在 README；缩进统一为 `.clang-format` 规定的 Tab
+  - `main.cu`：`online_softmax_v0` 的行映射由 `kBlockPerRowShuffle` 改为 `kThreadPerRow`（实现实为每线程处理一行，原配置 `grid = rows` 会超配约 256 倍 block），同步打印名 / `RowMap` / 线程数 / `SmemFor` 注释版本口径
+  - `operators/softmax/README.md`：状态表 / 版本规划 / 参考规模 / 目录布局与测试 / 场景说明按实际实现改为「每线程处理一行」，早期块内协作版描述（`warpMergeOnline` / `blockMergeOnline`）改为后续演进方向；online 开发采样替换为当前实现实测（4096² 4.1289 ms / 32.51 GB/s、16384×1024 3.3539 ms / 40.02 GB/s，max_err 5.488e-06 / 2.884e-06）
+  - 回归验证：`cmake --build build --target softmax` 编译通过，softmax 14/14（默认档）PASS
+- 2026-09-10 09:52 `AGENTS.md`：强化 §6 注释要求并校正风格描述
+  - §6 注释规范改写为「不缺 / 不冗余 / 不失真」三条硬性要求：新增源文件禁止裸提交、必备启动约束、推导与性能结论只进 README / notes、代码与文档冲突以实际代码为准
+  - §3 第 3 条补「注册项的 `RowMap` / `smem_bytes` 须与内核实际行映射一致 + 源码自带符合 §6 的注释」
+  - 修正 §6 `.clang-format` 描述：`IndentWidth 2` → `IndentWidth 4` + `UseTab: ForIndentation`（与仓库 `.clang-format` 一致）
+
+### Changed
+
+- 2026-09-10 09:28 全仓库源码统一 `clang-format` 格式化并校正风格文档
+  - 对 `common/`、`demo/`、`operators/{reduce,softmax}` 全部自有源文件执行 `clang-format -i --style=file`（排除 `build/`、`.venv/`）：旧文件原为 2 空格缩进，现统一为 `.clang-format` 规定的 Tab 缩进 + 行宽 100 重排，无语义变化
+  - 修正 `AGENTS.md` §6 风格描述：`IndentWidth 2` → `IndentWidth 4` + `UseTab: ForIndentation`，与仓库 `.clang-format` 实际取值一致
+  - 回归验证：reduce 16/16、softmax 14/14（默认档）PASS，`cmake --build build` 全目标编译通过
 
 ### Added
 
+- 2026-09-10 09:20 `operators/softmax`：新增 online softmax 独立实现单元并接入测试
+  - `online_softmax.cuh`：新增 online softmax 接口声明与设计说明 —— “online” 指单趟在线归约：用「运行最大 m + 运行分母 d」二元组在同一趟遍历里增量维护行最大与 Σexp（`m' = max(m,x)`、`d' = d*exp(m-m') + exp(x-m')`），求 m 与求 Σexp 合并为一趟全局读；声明 `online_softmax_v0`（每行一个 block、`grid = M`、块内 warp shuffle 合并、无动态共享内存、`blockDim.x` 为 32 的倍数且 <= 1024）
+  - `online_softmax.cu`：新增 `online_softmax_v0` 实现 —— 每线程以 stride 在线归约本线程子集；`warpMergeOnline` / `blockMergeOnline` 两级 warp shuffle 合并各线程 `(m,d)`（空子集以 `d == 0` 识别、合并时跳过，规避 `-inf - (-inf)` 的 NaN 传播），结果经静态 `__shared__` 广播回全体；第三次遍历重算 exp 归一化写回（全局读 2 遍 + 写 1 遍）。因 `-rdc=false` 无法跨翻译单元引用 `__device__`，该单元自带合并 helper、与 `softmax.cu` 的归约 helper 并列
+  - `main.cu`：被测内核表注册 `online_softmax_v0`（复用 `RowMap::kBlockPerRowShuffle`：`grid = rows`、smem = 0），同步 `RowMap` / 文件头注释版本口径
+  - 全量回归 7 内核 × 20 场景 140 项全部通过（默认档 14 项通过），覆盖空子集 / `N=0` / warp 边界等路径
+  - `operators/softmax/README.md`：状态表 / 版本规划 / 参考规模 / 目录布局与测试章节补 online-v0，并追加 online softmax 单独开发采样（4096² 0.7245 ms / 185.25 GB/s、16384×1024 0.8119 ms / 165.31 GB/s，max_err 1.329e-06 / 1.285e-06）
+  - 顶层 `README.md` / `AGENTS.md`：Softmax 状态同步为进行中（v0/v1/v2/v3/v4/v5 与 online-v0 完成，全量回归 140 项通过）
 - 2026-09-09 20:10 `operators/softmax`：新增 `softmax_v5`（全局读 2 遍 + float4，动态共享内存只缓存 exp）并接入测试
   - `softmax.cuh`：补 v5 声明与启动约束（与 v4 同为每行一个 block + 整行动态共享内存缓存，但缓存内容是 exp 而非 x：① 全局读 1 遍求行最大、② 再全局读 1 遍算 exp 并 16 B 整写进 smem 累加行和、③ 从 smem 读 exp 归一化 float4 写回 —— 以多读 1 遍全局换掉 v4 的 x smem 写/读往返），同步头部版本演进说明
   - `softmax.cu`：追加 v5 实现并给实现要点注释；文件头版本清单补 v5
