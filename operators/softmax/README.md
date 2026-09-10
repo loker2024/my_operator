@@ -22,11 +22,13 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
 | CUDA | online-v0 | online softmax：每线程处理一行（`row = blockIdx.x * blockDim.x + threadIdx.x`，`grid = ceil(M/block)`），单趟在线归约 —— 用「运行最大 m + 运行分母 d」二元组在同一趟遍历里增量维护行最大与 Σexp（`m' = max(m,x)`、`d' = d*exp(m-m') + exp(x-m')`），求 m 与 Σexp 合并为一趟全局读；第二趟读行重算 `exp(x-m)/d` 写回；无共享内存 | 完成（已接入测试） |
 | CUDA | online-v1 | online softmax 块内协作版：每行一个 block（`row = blockIdx.x`，`grid = rows`），行内 `blockDim.x` 个线程以 stride 单趟在线归约各自列子集的 `(m, d)`，再由两级 warp shuffle 合并出整行二元组（`mergeOnline` 以 `m == -inf` 识别空子集并跳过缩放，规避 `(-inf)-(-inf)` 的 NaN）；第二趟读行重算 `exp(x-m)/d` 写回；无共享内存，`blockDim.x` 为 32 的倍数且 <= 1024 | 完成（已接入测试） |
 | CUDA | online-v2 | online-v1 + `float4` 向量化：列宽为 4 的倍数（行首 16 B 对齐）时，单趟在线归约与写回的主循环每轮 stride 取 1 个 `float4`（4 分量逐一 `mergeOnline` / 算 exp 后 16 B 整写回），读/写指令数为标量 1/4；否则整行回退标量 —— 任意列宽均正确 | 完成（已接入测试） |
+| CUDA | online-v3 | 寄存器分片缓存：行映射 / 归约 / 启动约束同 online-v1/v2，每线程元素数 `ceil(N/blockDim.x) <= REG_TILE`（16）时，第 1 遍在线归约的同时把本线程负责的列缓存进**编译期定长、静态下标**的寄存器数组（`#pragma unroll` 整体展开，`ptxas -v` 实测 0 stack frame / 0 spill），写回遍直接取寄存器、省掉第 2 遍全局读；超过分片容量（block=256 时 `N > 4096`）自动回退 online-v1/v2 式两遍重读 —— 任意列宽均正确 | 完成（已接入测试；实测低于 online-v1/v2，见结论记录） |
+| CUDA | online-v3_false | online-v3 的反面对照：行映射 / 归约 / 启动约束同 online-v3，仅把寄存器分片的写法由「编译期定长 + 静态下标 `reg[k]`（真寄存器）」换成「运行期下标 `reg_cache[count++]`」—— 寄存器不可被运行期索引，ptxas 把该定长数组整体降级为 **local memory**（`ptxas -v` 实测 `64 bytes stack frame` = 16 槽 float 数组；数组名叫 reg 但并未落在寄存器，即「假寄存器」）。写回遍同样免掉第 2 遍全局读，代价是每次存取走 local memory（物理显存、仅靠 L1 缓存）。**不做列宽分派、无回退路径**：始终缓存，要求 `ceil(N/blockDim.x) <= 16`（block = 256 时 `N <= 4096`），超过则越界（由调用方保证） | 完成（已接入测试；实测宽行明显领先 online-v3、4096² 基本持平，见结论记录） |
 | Triton | t0 | 与 CUDA 同规格的 Triton 实现 | 规划中 |
 | Triton | t1 | 与 CUDA 性能对照并记录 | 规划中 |
 
 - 正确性判据：相对误差 ≤ 1e-5（逐元素，跳过 `|ref| < 1e-30` 的元素，见 `docs/benchmark-methodology.md`）。
-- 指标：有效带宽 =（输入读 + 输出写）/ 中位耗时，其中输入输出按**逻辑数据量**各计 1 次（每元素 4 B 读 + 4 B 写）。内核实际可能多次读行（v0 每元素读 3 次、online-v0/v1/v2 读 2 次 —— v0 与 online-v0 访存不合并、online-v1/online-v2 合并；v2/v3 读 3 遍、v4 读 1 遍、v5 读 2 遍），低效会直接反映为更低的有效带宽，便于横向比较。
+- 指标：有效带宽 =（输入读 + 输出写）/ 中位耗时，其中输入输出按**逻辑数据量**各计 1 次（每元素 4 B 读 + 4 B 写）。内核实际可能多次读行（v0 每元素读 3 次、online-v0/v1/v2 读 2 次、online-v3 与 online-v3_false 读 1 次 —— v0 与 online-v0 访存不合并、online-v1/online-v2/online-v3/online-v3_false 合并；v2/v3 读 3 遍、v4 读 1 遍、v5 读 2 遍），低效会直接反映为更低的有效带宽，便于横向比较。
 
 ## 版本规划说明
 
@@ -116,12 +118,46 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
   `float4` 重解释是未定义行为，尾列处理救不了跨行对齐）。任意列宽均正确，向量化
   收益限于对齐宽行。实测见结论记录：4096×4096 同场 189.10 GB/s、宽行 16384×1024
   177.55 GB/s，相对 online-v1 的 164.51 / 161.57 GB/s 分别提升 ~14.9% / ~9.9%。
+- **online-v3 寄存器分片缓存（已实现并接入测试）**：行映射 / 归约 / 启动约束同
+  online-v1/v2，只改写回遍的 x 来源 —— 把「重读全局」换成「读寄存器分片」。每线程
+  元素数 `ceil(N / blockDim.x) <= kRegTile`（16）时走寄存器路径：第 1 遍在线归约的同时
+  把本线程负责的列（列号 `tid + k*blockDim.x`）缓存进 `float reg[kRegTile]`，写回遍直接
+  取 `reg[k]`，全局流量由「读 2 遍 + 写 1 遍」降为「读 1 遍 + 写 1 遍」（与 v4 同达
+  理论下限，但不占用动态共享内存）；否则（列宽过大、分片装不下）自动回退 online-v1/v2
+  式两遍重读，任意列宽均正确。**真寄存器的前提是静态下标**：`kRegTile` 为编译期常量 +
+  `#pragma unroll` 整体展开使下标 `k` 成为常量，`reg[k]` 才留在寄存器；朴素的
+  `reg_cache[count++]`（运行期下标）会被 ptxas 把数组整体降级为 **local memory**
+  （物理是显存、仅靠 L1 缓存），名字叫 reg 而非寄存器。分派条件只依赖 `N` 与 `blockDim`、
+  对整 block 一致，故两条分支内的 `__syncthreads` 均安全。实测（同场开发采样）：`ptxas -v`
+  确认 `0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`（真寄存器目标达成），
+  但 `Used 63 registers`（online-v1 为 19、online-v2 为 26）使 SM 驻留 block 数由 6 降到 4；
+  且 `kRegTile` 是固定常量，每线程元素数不足 16 时仍要执行全部 16 轮展开（`16384×1024`
+  每线程仅 4 个元素，展开利用率 1/4）。两者叠加，同场 **低于** online-v1/v2（4096²
+  183.99 GB/s vs 212.22 / 216.59；16384×1024 132.63 GB/s vs 216.03 / 199.43）——即使全局
+  流量减半也无收益，说明当前形状的瓶颈在占用与指令数而非读行次数。本版价值在验证「真寄存器
+  缓存可行且 0 spill」并把该路线走通；后续要拿收益，需按列宽分列实例化（模板 `T` 取 4/8/16，
+  运行时按 `ceil(N/blockDim.x)` 选实例）以同时压低寄存器数与无效展开。
+- **online-v3_false「假寄存器」反面对照（已实现并接入测试）**：与 online-v3 逐项同构
+  （行映射 / 归约 / 启动约束一致，`grid = rows`、无动态共享内存），唯一区别在缓存本线程
+  列时的下标 —— online-v3 用编译期常量下标 `reg[k]`（`#pragma unroll` 整体展开，下标
+  常量化 → 真寄存器），本版用运行期下标 `reg_cache[count++]`。寄存器不可被运行期索引，
+  ptxas 只能把整个定长数组放进 **local memory**（物理是显存、仅靠 L1 缓存），数组名字叫
+  reg 但并未落在寄存器 —— 即「假寄存器」。**本版刻意不做列宽分派、无回退路径**：始终
+  缓存，要求 `ceil(N/blockDim.x) <= kRegTile`（block = 256 时 `N <= 4096`），以与 v3
+  形成最干净的对照（去掉分派开销）。两者都免掉写回遍的第 2 遍全局读，差别只在「缓存
+  介质」是寄存器还是 local memory。实测见结论记录：本版在宽行上**明显快于** online-v3、
+  4096² 基本持平 —— v3 的真寄存器方案 `Used 63 registers`、SM 驻留 block 数由 6 降到 4，
+  而本版仅 `Used 19 registers`（与 online-v1 的 19 相同）、占用不受损，local memory 又有
+  L1 兜底，故 16384×1024 上 175.34 vs 134.87 GB/s（+30%）、4096² 202.16 vs
+  202.25 GB/s（差 0.05%，采样波动内）。结论：寄存器分片路线的瓶颈在**寄存器压力**而非读
+  行次数 —— v3 的「真寄存器」目标达成，但 63 寄存器带来的占用损失盖过了少读一遍的收益；
+  反过来，占用友好的「local memory 缓存」在当前形状下不逊于真寄存器、宽行上更划算。
 
 ## 参考规模
 
 - 默认：`rows=4096, cols=4096`（fp32，约 64 MiB 输入）。
 - 可选：`rows=16384, cols=1024`（宽行场景）。
-- block 大小默认 256（v0 与 online-v0：`grid = ceil(rows/block)`，每线程处理一行；v1/v2/v3/v4/v5 与 online-v1/online-v2：`grid = rows`，行内由 256 个线程协作；v2/v3/v4/v5 与 online-v1/online-v2 另要求 32 的倍数且 <= 1024；v4/v5 额外要求动态共享内存 `N * sizeof(float)` 不超上限，见状态表与版本规划）。
+- block 大小默认 256（v0 与 online-v0：`grid = ceil(rows/block)`，每线程处理一行；v1/v2/v3/v4/v5 与 online-v1/online-v2/online-v3/online-v3_false：`grid = rows`，行内由 256 个线程协作；v2/v3/v4/v5 与 online-v1/online-v2/online-v3/online-v3_false 另要求 32 的倍数且 <= 1024；v4/v5 额外要求动态共享内存 `N * sizeof(float)` 不超上限，见状态表与版本规划）。
 
 ## 目录布局与测试
 
@@ -129,28 +165,31 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
 softmax/
 ├── README.md   # 本文档：规划 + 结论总表
 ├── CMakeLists.txt  # 构建脚本（src/main.cu 存在即自动启用）
-└── src/        # CUDA 实现（当前 v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2，后续版本追加进对应 .cuh/.cu）
+└── src/        # CUDA 实现（当前 v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false，后续版本追加进对应 .cuh/.cu）
     ├── softmax.cuh / softmax.cu   # 算子接口与实现：v0~v5（被测试对象）
-    ├── online_softmax.cuh / .cu   # 独立实现单元：online softmax 单趟在线归约（online-v0/v1/v2）
+    ├── online_softmax.cuh / .cu   # 独立实现单元：online softmax 单趟在线归约（online-v0/v1/v2/v3/v3_false）
     ├── test.cuh  / test.cu        # 可复用测试驱动：正确性(容差1e-5)+性能
-    └── main.cu                    # 执行入口：注册 v0~v5 与 online-v0/v1/v2，运行测试
+    └── main.cu                    # 执行入口：注册 v0~v5 与 online-v0/v1/v2/v3/v3_false，运行测试
 ```
 
 > 注：`triton/` 与 `notes/` 属规划目录，尚未创建。
 
 测试入口 `src/main.cu` 将 `softmax_v0` ~ `softmax_v5` 与 `online_softmax_v0` /
-`online_softmax_v1` / `online_softmax_v2` 注册给同一测试驱动（`online_softmax_v0` /
-`v1` / `v2` 为独立实现单元，见 `online_softmax.cuh`）。
+`online_softmax_v1` / `online_softmax_v2` / `online_softmax_v3` / `online_softmax_v3_false`
+注册给同一测试驱动（`online_softmax_v0` / `v1` / `v2` / `v3` / `v3_false` 为独立实现单元，
+见 `online_softmax.cuh`）。
 因各版行映射与共享内存不同，`main.cu` 以 `RowMap` 描述各内核并按场景推出
 启动配置（见 `softmax.cuh` / `online_softmax.cuh` 各版本声明）：v0 每线程处理一行 →
 `grid = ceil(rows/block)`、无共享内存；v1 每行一个 block → `grid = rows`、动态共享内存
 `blockDim.x * sizeof(float)`；v2/v3 每行一个 block → `grid = rows`、
 无动态共享内存（内部仅静态 `__shared__` 中转；v3 的 `float4` 向量化只影响行内访问，
 启动配置同 v2）；online-v0 每线程处理一行 → `grid = ceil(rows/block)`、无共享内存
-（与 v0 同为 `RowMap::kThreadPerRow`，差别只在行内归约语义）；online-v1/online-v2
-每行一个 block → 与 v2/v3 同为 `RowMap::kBlockPerRowShuffle`（`grid = rows`、无动态
-共享内存，内部仅静态 `__shared__` 中转；online-v2 的 `float4` 向量化只影响行内访问，
-启动配置同 online-v1）；v4/v5 每行一个 block →
+（与 v0 同为 `RowMap::kThreadPerRow`，差别只在行内归约语义）；online-v1/online-v2/
+online-v3/online-v3_false 每行一个 block → 与 v2/v3 同为
+`RowMap::kBlockPerRowShuffle`（`grid = rows`、无动态共享内存，内部仅静态 `__shared__`
+中转；online-v2 的 `float4` 向量化只影响行内访问，启动配置同 online-v1；online-v3 与
+online-v3_false 的寄存器 / local memory 分片缓存只影响写回遍的 x 来源，启动配置亦同
+online-v1）；v4/v5 每行一个 block →
 `grid = rows`、动态共享内存 `cols * sizeof(float)`（随列宽增长，`main.cu` 的 `SmemFor`
 需按列宽传入 —— v4 缓存整行 x、v5 缓存整行 exp）。
 每内核覆盖三类场景：
@@ -174,7 +213,7 @@ softmax/
 
 | 开关 | 默认 | 作用 |
 | --- | --- | --- |
-| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（9 内核共 180 项） |
+| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（10 内核共 200 项） |
 | `strict_benchmark` | `false` | 是否按严格口径采样（透传给 `test_softmax_kernel` 的同名参数，与 reduce 测试一致）：关闭时 1 次预热 + 100 次迭代；开启时 100 次预热 + 21 组 × 1000 次并输出 P5/P95 |
 
 日常开发保持默认即可（只跑有性能意义的大规模形状）；出严格基准数字或做全量
@@ -190,11 +229,49 @@ cmake --build build --target softmax
 
 ## 结论记录
 
-下表为**开发采样**（默认档：1 次预热 + 100 次迭代，`strict_benchmark=false`，
-2026-09-09 运行），v0/v1/v2/v3/v4/v5 各数值取自**同一次运行**，横向可比。v0 单次
-内核开销 ~4–5 ms，按严格档（100 预热 + 21 组 × 1000 次，见
-`docs/benchmark-methodology.md` §3.2）跑完整张表约十分钟；
-需要时可用开关 `strict_benchmark=true` 逐形状采样后再回填。
+### 严格基准综合对比（2026-09-10）
+
+下表为**严格档**（`enable_boundary=true` + `strict_benchmark=true`，100 次预热 +
+21 组 × 1000 次迭代取中位数，见 `docs/benchmark-methodology.md` §3.2）**当时已接入的
+9 个内核同一次运行**的结果，横向可比（该次运行早于 online-v3 / online-v3_false 接入，
+二者见后续各自的开发采样小节）。本次覆盖 A/B/C 三组共 20 场景 × 9 内核 = 180 项，
+全部 PASS（容差 1e-5），全程约 9 分 34 秒。有效带宽按逻辑数据量（每元素读 1 次 +
+写 1 次）。
+
+| 内核 | 4096×4096 ms | GB/s | 16384×1024 ms | GB/s | max_err (4096² / 16384×1024) |
+| --- | --- | --- | --- | --- | --- |
+| v0 (每线程一行, 串行三遍) | 4.3529 | 30.83 | 3.3758 | 39.76 | 5.478e-06 / 2.537e-06 |
+| v1 (块内树形归约) | 0.6710 | 200.01 | 0.7220 | 185.90 | 1.231e-06 / 1.234e-06 |
+| v2 (warp shuffle 归约) | 0.6985 | 192.14 | 0.6801 | 197.34 | 1.232e-06 / 1.244e-06 |
+| v3 (float4 向量化) | 0.6962 | 192.78 | 0.6866 | 195.49 | 1.255e-06 / 1.237e-06 |
+| v4 (整行 smem 缓存 x) | 0.6690 | 200.64 | 0.7054 | 190.26 | 1.223e-06 / 1.237e-06 |
+| v5 (读 2 遍 float4, smem 存 exp) | 0.6813 | 197.01 | 0.6402 | 209.66 | 1.223e-06 / 1.237e-06 |
+| online-v0 (每线程一行, 单趟在线) | 3.3935 | 39.55 | 3.0094 | 44.60 | 5.488e-06 / 2.884e-06 |
+| online-v1 (在线 + 两级 shuffle) | 0.7022 | 191.15 | 0.7723 | 173.79 | 1.329e-06 / 1.285e-06 |
+| online-v2 (在线 + float4) | 0.7044 | 190.55 | 0.7089 | 189.34 | 1.341e-06 / 1.392e-06 |
+
+要点：
+
+1. **正确性全部达标**：180/180 PASS。`v0` / `online-v0` 因单线程串行累加误差最大
+   （5.5e-06，约容差一半）；引入树形 / shuffle 归约后降到 1.2–1.4e-06（约降 4.5×）。
+2. **性能两档分明**：`v0`（31–40 GB/s）与 `online-v0`（40–45 GB/s）因每线程独占整行、
+   warp 内访存不合并、并行度低而明显落后；其余 7 个内核 0.64–0.77 ms、174–210 GB/s，
+   集中收敛在同一条带上。
+3. **形状最优解不同**：4096×4096 上 `v4` 最佳（0.6690 ms / 200.64 GB/s，`v1` 的
+   200.01 GB/s 几乎并列）；16384×1024 上 `v5` 最佳（0.6402 ms / 209.66 GB/s，全表
+   最高，达理论峰值 256 GB/s 的 82%）。
+4. **相对加速**：`v5` 相对 `v0` 在 4096² 快 6.5×、16384×1024 快 5.3×；`online-v2`
+   相对 `online-v0` 分别快 4.8× / 4.2×。
+5. **在线归约的代价**：`online-v2` 与同结构 `v3` 基本持平（−1.2% / −3.2%）；但
+   `online-v1` 在 16384×1024 上比 `v2` 慢 13.5% —— 宽行场景下「省一遍全局读」的收益
+   被两级 shuffle 合并开销抵消。在线归约的价值在通用性（可迁移到 FlashAttention 的
+   分块 + 在线合并场景），非峰值性能。
+6. **已逼近硬件上限**：7 个快内核全部收敛在 190–210 GB/s 窄带内，瓶颈已从访存合并 /
+   占用转移到显存实际带宽，继续微调收益有限。
+7. **数据可信**：各形状 P5/P95 离散度普遍 < 8%，严格档采样稳定。
+
+下方为早期**开发采样**（默认档：1 次预热 + 100 次迭代，`strict_benchmark=false`，
+2026-09-09 运行），保留作历史参考，与严格档非同一次运行。
 
 | 设备 / 构建 / 采样 | 值 |
 | --- | --- |
@@ -215,6 +292,8 @@ cmake --build build --target softmax
 > 复用：4096×4096 的整行 16 KiB 动态共享内存拉低 SM 驻留数，抵消了少读行收益。
 > 各版本均低于显存理论峰值 256 GB/s；本次运行相对前次全表整体 ±10% 波动，
 > 结论以同场横向对比为准，进一步优化应聚焦占用 / 数据复用粒度。
+
+### v0–v5 开发采样（2026-09-09）
 
 | 版本 | 形状 | 耗时 ms | 有效带宽 GB/s | max_err | 备注 |
 | --- | --- | --- | --- | --- | --- |
@@ -259,3 +338,76 @@ cmake --build build --target softmax
 189.86 / 157.46 GB/s 同量级（非同场，仅作量级对照）—— 说明向量化在在线归约上同样
 有效。online 相对 v2/v3 少读 1 遍行，但 exp 每元素要算 2 次（在线更新 + 写回各 1 次），
 当前形状下两者基本抵消；下一步可评估减少 exp 次数的收益。
+
+### online-v3 寄存器分片开发采样（2026-09-10）
+
+`online_softmax_v3` 与 `online-v1` / `online-v2` **同一次开发采样**（默认档：1 次预热 +
+100 次迭代，`strict_benchmark=false`，2026-09-10 运行）：
+
+| 内核 | 4096×4096 ms | GB/s | 16384×1024 ms | GB/s | max_err (4096² / 16384×1024) | 寄存器 | 片内 spill |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| online-v1 | 0.6324 | 212.22 | 0.6213 | 216.03 | 1.329e-06 / 1.285e-06 | 19 | 0 |
+| online-v2 | 0.6197 | 216.59 | 0.6730 | 199.43 | 1.341e-06 / 1.392e-06 | 26 | 0 |
+| online-v3 | 0.7295 | 183.99 | 1.0120 | 132.63 | 1.329e-06 / 1.285e-06 | 63 | 0 |
+
+要点：
+
+1. **“真寄存器”目标达成**：`nvcc -Xptxas -v` 对 `online_softmax_v3` 报告 `0 bytes
+   stack frame, 0 bytes spill stores, 0 bytes spill loads` —— `reg[kRegTile]` 确实
+   落在寄存器（对比运行期下标 `reg_cache[count++]` 的 `online_softmax_v3_false`，
+   该判据不成立，见下节）。
+2. **正确性与 online-v1/v2 一致**：`max_err` 完全相同（1.329e-06 / 1.285e-06），因为
+   三者的 `(m, d)` 归约路径一模一样，v3 只改第二遍 x 的来源。
+3. **性能低于 online-v1/v2**，两个原因叠加：
+   - **寄存器数 63（v1 为 19、v2 为 26）**：block=256、sm_89 每 SM 64K 寄存器，驻留
+     block 数由 6 降到 4，占用下降抵消了“全局读 2 遍 → 1 遍”的收益；
+   - **`kRegTile` 固定为 16**：`16384×1024` 每线程仅 4 个元素，却仍执行 16 轮展开
+     （`#pragma unroll` 的定长循环，12 轮为空转守卫），指令数明显多于 online-v2，
+     该形状掉到 132.63 GB/s。
+4. **回退路径已单独验证**：把 `kRegTile` 临时调为 2 强制正常场景走回退，结果与寄存器
+   路径逐项一致（`max_err` 相同、全部 PASS），确认分派与回退分支正确。
+
+结论：本版把“寄存器分片缓存”路线走通并给出可复现对照（真寄存器、0 spill、正确性不变），
+但当前形状无收益。要拿到收益需按列宽分列实例化（模板 `T` 取 4/8/16，运行时按
+`ceil(N/blockDim.x)` 选实例），同时压低寄存器数与无效展开。
+
+### online-v3_false「假寄存器」开发采样（2026-09-10）
+
+`online_softmax_v3_false` 与 `online-v1` / `online-v2` / `online-v3` **同一次开发采样**
+（默认档：1 次预热 + 100 次迭代，`strict_benchmark=false`，2026-09-10 运行）。本次是
+v3_false 接入后新跑的一轮，与上方 online-v3 表**非同一次运行**，仅供量级参考、不与
+v0–v5 逐项横比（同机同构建，单次采样波动约 ±10%）：
+
+| 内核 | 4096×4096 ms | GB/s | 16384×1024 ms | GB/s | max_err (4096² / 16384×1024) | 寄存器 | 栈帧 / spill |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| online-v1 | 0.6126 | 219.09 | 0.6598 | 203.43 | 1.329e-06 / 1.285e-06 | 19 | 0 / 0 |
+| online-v2 | 0.6144 | 218.46 | 0.6152 | 218.17 | 1.341e-06 / 1.392e-06 | 26 | 0 / 0 |
+| online-v3 | 0.6636 | 202.25 | 0.9951 | 134.87 | 1.329e-06 / 1.285e-06 | 63 | 0 / 0 |
+| online-v3_false | 0.6639 | 202.16 | 0.7655 | 175.34 | 1.329e-06 / 1.285e-06 | 19 | 64 B / 0 |
+
+要点：
+
+1. **“假寄存器”判据成立**：`nvcc -Xptxas -v` 对 `online_softmax_v3_false` 报告
+   `64 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads` —— 64 B 恰为
+   `kRegTile`(16) × sizeof(float) 的定长数组，说明 `reg_cache` 整体落在 local memory
+   （栈帧）而非寄存器；同场 online-v3 的同一判据为 `0 bytes stack frame`。
+2. **正确性与 online-v1/v2/v3 完全一致**：`max_err` 逐项相同（1.329e-06 / 1.285e-06），
+   因为四者的 `(m, d)` 归约路径一模一样，v3 / v3_false 只改写回遍 x 的来源。
+3. **宽行上明显快于 online-v3、4096² 基本持平**：4096² 202.16 vs 202.25 GB/s（差
+   0.05%，在采样波动内），16384×1024 175.34 vs 134.87 GB/s（+30%）。原因在寄存器压力
+   而非访存 —— v3 的真寄存器方案 `Used 63 registers`（SM 驻留 block 数由 6 降到 4），
+   本版仅 `Used 19 registers`（与 online-v1 的 19 相同）、占用不受损；local memory
+   存取又有 L1 兜底，故“少读一遍全局”的收益得以兑现。宽行 `16384×1024` 上 v3 还叠加了
+   `kRegTile` 固定 16 带来的无效展开（每线程仅 4 元素却跑 16 轮），本版按 `N` 定界的
+   运行期循环无此开销，故两者差距在此形状最大。
+4. **无回退路径（按设计）**：本版不做列宽分派、始终缓存，契约要求
+   `ceil(N/blockDim.x) <= kRegTile`（block = 256 时 `N <= 4096`）。当前全部测试场景
+   均满足该条件 —— 正常流程最大列宽 4096（每线程恰 16 个元素）、边界条件最大列宽
+   `4×(2×256−1) = 2044`（每线程 8 个元素）—— 故无需分派即可覆盖，去掉分支也让与 v3 的
+   对照更干净。
+
+结论：v3_false 印证了「寄存器分片缓存」路线的瓶颈在**寄存器压力**而非读行次数 ——
+真寄存器（v3）以 63 寄存器换来的“少读一遍”被占用损失盖过；占用友好的 local memory
+缓存（v3_false）反而更划算。两者共同指向：要真正兑现少读一遍的收益，需按列宽分列
+实例化以同时压低寄存器数与无效展开（v3 路线），或接受 local memory 由 L1 兜底
+（v3_false 路线）。

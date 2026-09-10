@@ -12,7 +12,10 @@
 //   单元内各版本的差别只在行内 / 块内的协作方式与访存宽度：v0 每线程独占一行
 //   （无协作），v1 每行一个 block、块内两级 warp shuffle 合并各线程的 (m, d)
 //   （读合并，是后续「分块 + 在线合并」的 FlashAttention 形态的雏形），v2 在 v1
-//   基础上按列宽分派 float4 向量化（仅影响行内访问宽度，归约与启动约束同 v1）。
+//   基础上按列宽分派 float4 向量化（仅影响行内访问宽度，归约与启动约束同 v1），
+//   v3 用编译期定长 + 静态下标的寄存器分片缓存省掉第 2 遍全局读，v3_false 是 v3
+//   的反面对照 —— 同样想缓存行，但用运行期下标写入定长数组，被 ptxas 降级为
+//   local memory（“假寄存器”）。
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -51,3 +54,30 @@ __global__ void online_softmax_v1(const float* input, float* output, const int M
 //     越界空转）、blockDim.x 为 32 的倍数且 <= 1024；smem_bytes = 0；N == 0 的空行
 //     不读不写。
 __global__ void online_softmax_v2(const float* input, float* output, const int M, const int N);
+
+// online_softmax_v3 行遍历 / 归约 / 启动约束同 v1/v2（每行一个 block、单趟在线归约 +
+//   两级 warp shuffle 合并；row = blockIdx.x、grid = M（M == 0 时也须 >= 1，由
+//   row >= M 越界空转）、blockDim.x 为 32 的倍数且 <= 1024、无动态共享内存、
+//   N == 0 的空行不读不写），仅把写回遍的 x 来源从「重读全局」改为「寄存器分片缓存」：
+//   * 每线程元素数 ceil(N / blockDim.x) <= REG_TILE（常数，当前 16，见
+//     online_softmax.cu 的 kRegTile）时走寄存器路径 —— 第 1 遍在线归约的同时把本线程
+//     负责的列缓存进**编译期定长、静态下标**的寄存器数组（#pragma unroll 整体展开，
+//     reg[k] 静态寻址故留在寄存器、不会降级为 local memory），写回遍直接取寄存器，
+//     省掉第 2 遍全局读；
+//   * 否则（列宽过大、寄存器分片装不下）自动回退 v1/v2 式两遍重读 —— 与 v0~v2 一样
+//     对任意列宽均正确。分派条件只依赖 N 与 blockDim、对整 block 一致，两条分支内的
+//     __syncthreads 均安全。
+__global__ void online_softmax_v3(const float* input, float* output, const int M, const int N);
+
+// online_softmax_v3_false 行遍历 / 归约 / 启动约束均同 v3，唯一区别在「寄存器分片」的写法
+//   —— 本版刻意用**运行期下标**缓存本线程列（`reg_cache[count++]`）。寄存器不可被运行期
+//   索引，ptxas 会把该定长数组整体降级为 **local memory**（物理是显存、仅靠 L1 缓存），
+//   数组名字叫 reg 但并未落在寄存器 —— 即「假寄存器」。
+//   * **不做列宽分派、无回退路径**，始终缓存：要求 ceil(N / blockDim.x) <= kRegTile（16，
+//     见 online_softmax.cu；block = 256 时 N <= 4096）。超过则该定长数组越界写入（未定义
+//     行为），由调用方保证 —— 去掉分派是为了与 v3 形成最干净的对照。
+//   * 第 1 遍在线归约的同时把本线程负责的列以运行期下标写入定长数组，写回遍按同一顺序
+//     取回，省掉第 2 遍全局读，但每次存取走 local memory。
+//   本版是 v3 的反面对照：与 v3 逐项同构，只差下标是否静态，用于量化「local memory 缓存」
+//   相对「真寄存器缓存」/「重读全局」的代价，实测见 README.md。
+__global__ void online_softmax_v3_false(const float* input, float* output, const int M, const int N);

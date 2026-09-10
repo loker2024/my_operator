@@ -47,6 +47,21 @@
 
 ### Added
 
+- 2026-09-10 13:34 `operators/softmax`：新增并接入 `online_softmax_v3_false`（“假寄存器”反面对照，运行期下标缓存被 ptxas 降级为 local memory）
+  - `online_softmax.cu`：新增 v3_false 内核 —— 行映射 / 归约 / 启动约束与 online-v3 逐项同构，唯一区别是缓存本线程列时用运行期下标 `reg_cache[count++]`（而非 v3 的编译期常量下标 `reg[k]`）；寄存器不可被运行期索引，ptxas 把该定长数组整体降级为 local memory，写回遍仍免掉第 2 遍全局读。按设计**不做列宽分派、无回退路径**，始终缓存，要求 `ceil(N/blockDim.x) <= kRegTile`（block = 256 时 `N <= 4096`），超过则越界（由调用方保证）
+  - `online_softmax.cuh`：补 v3_false 声明与设计说明（与 v3 的对照关系、“假寄存器真 local memory”的成因与判据），文件头补单元内 v3 / v3_false 差异
+  - `main.cu`：被测内核表注册 `online_softmax_v3_false`（复用 `RowMap::kBlockPerRowShuffle`：`grid = rows`、smem = 0），同步 `kBlock` / `RowMap` / `GridFor` / `SmemFor` 注释的版本口径
+  - 验证：`nvcc -Xptxas -v` 对 v3_false 报告 `64 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`、`Used 19 registers`（同场 online-v3 为 `0 bytes stack frame`、`Used 63 registers`）—— 64 B 恰为 `kRegTile`(16) × sizeof(float)，证实数组落在 local memory；开启 `enable_boundary` 全量回归 11 内核 × 20 场景 220 项全部 PASS（全部场景每线程元素数 ≤ 16，满足无回退版本的契约）
+  - 实测（同场开发采样）：v3_false 宽行明显领先 online-v3、4096² 基本持平（16384×1024 0.7655 ms / 175.34 GB/s vs 0.9951 ms / 134.87 GB/s，+30%；4096² 0.6639 ms / 202.16 GB/s vs 0.6636 ms / 202.25 GB/s，差 0.05%）—— v3 的 63 寄存器使 SM 驻留 block 数由 6 降到 4，占用损失盖过“少读一遍全局”的收益；v3_false 仅 19 寄存器、local memory 由 L1 兜底，宽行上更划算
+  - `operators/softmax/README.md`：状态表 / 版本规划 / 指标口径 / 参考规模 / 目录布局与测试 / 开关说明补 online-v3_false，追加 v3_false 与 online-v1/v2/v3 同场开发采样（含寄存器 19/63 与栈帧 64 B 对照）
+  - 顶层 `README.md` / `AGENTS.md`：Softmax 状态同步为进行中（v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false 完成，全量回归 220 项通过）
+- 2026-09-10 12:20 `operators/softmax`：新增并接入 `online_softmax_v3`（寄存器分片缓存，真寄存器 0 spill）
+  - `online_softmax.cu`：新增 v3 内核 —— 每线程元素数 `ceil(N/blockDim.x) <= kRegTile`（16）时，第 1 遍在线归约的同时把本线程负责的列缓存进 `float reg[kRegTile]`，写回遍直接取寄存器、省掉第 2 遍全局读；超容量（block=256 时 `N > 4096`）自动回退 online-v1/v2 式两遍重读。真寄存器的前提是静态下标：`kRegTile` 为编译期常量 + `#pragma unroll` 整体展开使下标 `k` 成为常量（草稿的 `reg_cache[count++]` 是运行期下标，会被 ptxas 降级为 local memory）；分派条件只依赖 `N` / `blockDim`、对整 block 一致，两条分支内的 `__syncthreads` 安全。顺带移除草稿遗留的 clang 内部头文件 include（原导致 nvcc 编译失败，与 online-v1/v2 草稿同类缺陷），并把散落的行尾空白 / tab-only 空行按 `.clang-format` 整理
+  - `online_softmax.cuh`：补 v3 声明与启动约束（行遍历 / 归约 / 启动约束同 v1/v2，仅写回遍的 x 来源改为寄存器分片；分片容量常数 `kRegTile` = 16，超容量自动回退），文件头补单元内 v0/v1/v2/v3 差异
+  - `main.cu`：被测内核表注册 `online_softmax_v3`（复用 `RowMap::kBlockPerRowShuffle`：`grid = rows`、smem = 0），同步 `kBlock` / `RowMap` / `GridFor` / `SmemFor` 注释的版本口径
+  - 验证：`nvcc -Xptxas -v` 对 v3 报告 `0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`（真寄存器）与 `Used 63 registers`（online-v1 为 19、online-v2 为 26）；回退路径以临时 `kRegTile = 2` 强制正常场景走回退验证通过（结果与寄存器路径逐项一致）；默认档 20/20 PASS
+  - 实测（同场开发采样）：v3 低于 online-v1/v2（4096² 183.99 GB/s vs 212.22 / 216.59，16384×1024 132.63 GB/s vs 216.03 / 199.43）—— 寄存器数 63 使 SM 驻留 block 数由 6 降到 4，且 `kRegTile` 固定 16 使每线程元素少时仍执行 16 轮展开（`16384×1024` 每线程仅 4 个元素）；结论：真寄存器目标达成但当前形状无收益，后续需按列宽分列实例化
+  - `operators/softmax/README.md`：状态表 / 版本规划 / 指标口径 / 参考规模 / 目录布局 / 测试章节补 online-v3，并追加 online-v3 与 online-v1/v2 同场开发采样（含寄存器数 19/26/63 与 0 spill 对照）
 - 2026-09-10 10:59 `operators/softmax`：新增并接入 `online_softmax_v2`（online-v1 + float4 向量化）
   - `online_softmax.cu`：追加 v2 内核并修复草稿缺陷 —— 移除草稿遗留的 clang 内部头文件 include（原导致编译失败）、统一 `.clang-format` 规定的 Tab 缩进、写回改 `float4` 整写（原为标量写且 `y4` 声明未用）、补齐文件头版本清单与内核注释
   - `online_softmax.cuh`：补 v2 声明与启动约束（列宽为 4 的倍数时行内以 `float4` 单趟在线归约 + 整写回，否则整行回退标量；启动约束同 v1），文件头补单元内 v0/v1/v2 差异

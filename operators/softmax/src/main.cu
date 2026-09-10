@@ -22,8 +22,8 @@
 namespace {
 
 // 每 block 线程数（默认 256）：v0/online-v0 用它铺满行号，v1/v2/v3/v4/v5/online-v1/
-// online-v2 用作每行的协作线程数。256 同时满足 v1 的"2 的幂"（折半归约）与 v2/v3/
-// v4/v5/online-v1/online-v2 的"32 的倍数"（warp shuffle）约束，见 softmax.cuh /
+// online-v2/online-v3/online-v3_false 用作每行的协作线程数。256 同时满足 v1 的"2 的幂"（折半归约）与 v2/v3/
+// v4/v5/online-v1/online-v2/online-v3/online-v3_false 的"32 的倍数"（warp shuffle）约束，见 softmax.cuh /
 // online_softmax.cuh 各版本的启动约束。
 constexpr int kBlock = 256;
 
@@ -32,8 +32,8 @@ constexpr int kBlock = 256;
 enum class RowMap {
 	kThreadPerRow,  // v0/online-v0：每线程处理一行，grid = ceil(rows / block)，无共享内存
 	kBlockPerRow,         // v1：每行一个 block，grid = rows，smem = block * sizeof(float)
-	kBlockPerRowShuffle,  // v2/v3/online-v1/online-v2：每行一个 block + 两级 warp
-	                      //     shuffle 归约，grid = rows，无动态共享内存（内部仅静态
+	kBlockPerRowShuffle,  // v2/v3/online-v1/online-v2/online-v3/online-v3_false：每行一个 block +
+	                      //     两级 warp shuffle 归约，grid = rows，无动态共享内存（内部仅静态
 	                      //     __shared__ 中转）。v3 与 online-v2 的 float4 向量化只
 	                      //     影响行内访问，启动配置同 v2；online-v1 的在线归约同理
 	                      //     （见 online_softmax.cuh v1/v2）
@@ -63,6 +63,10 @@ const KernelEntry kKernels[] = {
      RowMap::kBlockPerRowShuffle},
     {"online_softmax_v2 (每行一个 block, 单趟在线归约 + float4)", online_softmax_v2,
      RowMap::kBlockPerRowShuffle},
+    {"online_softmax_v3 (每行一个 block, 单趟在线归约 + 寄存器分片缓存)", online_softmax_v3,
+     RowMap::kBlockPerRowShuffle},
+    {"online_softmax_v3_false (每行一个 block, 单趟在线归约 + 运行期下标缓存→local memory)",
+     online_softmax_v3_false, RowMap::kBlockPerRowShuffle},
 };
 
 // 测试场景。label 仅用于打印；rows × cols 为矩阵形状，grid/smem 由被测内核的
@@ -127,7 +131,7 @@ const Scenario kAbnormalScenarios[] = {
 
 // 按行映射方式求“覆盖全部行”的最小 grid；rows == 0 时也须 >= 1（内核以
 // row >= rows 越界空转，见 softmax.cuh / online_softmax.cuh）。kBlockPerRow /
-// kBlockPerRowShuffle（含 online-v1/online-v2）/ kBlockPerRowRowCache 都是每行一个
+// kBlockPerRowShuffle（含 online-v1/online-v2/online-v3/online-v3_false）/ kBlockPerRowRowCache 都是每行一个
 // block → grid = rows。
 int GridFor(int rows, RowMap row_map) {
 	if (rows == 0) return 1;
@@ -151,7 +155,8 @@ std::size_t SmemFor(RowMap row_map, int cols) {
 		case RowMap::kBlockPerRow:
 			return static_cast<std::size_t>(kBlock) * sizeof(float);  // v1 动态共享内存
 		case RowMap::kBlockPerRowShuffle:
-			return 0;  // v2/v3/online-v1/online-v2 仅用内部静态 __shared__ 中转，无需动态共享内存
+			return 0;  // v2/v3/online-v1/online-v2/online-v3/online-v3_false 仅用内部静态
+			           // __shared__ 中转，无需动态共享内存
 		case RowMap::kBlockPerRowRowCache:
 			return static_cast<std::size_t>(cols) * sizeof(float);  // v4/v5 整行缓存，随行宽
 	}
