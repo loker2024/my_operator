@@ -41,6 +41,13 @@
 
 ### Added
 
+- 2026-09-10 10:25 `operators/softmax`：新增并接入 `online_softmax_v1`（块内协作版在线归约）
+  - `online_softmax.cuh`：补 v1 声明与启动约束（每行一个 block、`row = blockIdx.x`、`grid = M`、`blockDim.x` 为 32 的倍数且 <= 1024、无动态共享内存；未分到元素的线程 / warp 以 `(m = -inf, d = 0)` 作归约单位元），文件头补单元内 v0 / v1 的行映射差异
+  - `online_softmax.cu`：补 v1 注释并修复草稿缺陷 —— 提取 `mergeOnline`（二元组结合运算，空集一侧跳过缩放以规避 `(-inf)-(-inf)` 经 `expf` 污染整行分母）、`warpReduceOnline` / `blockReduceOnline` 两级 shuffle 合并并补齐「warp 值写入后」「结果广播前」两处 `__syncthreads`、补 `row >= M` 越界空转守卫；移除草稿遗留的 clang 内部头文件 include 并按 `.clang-format` 统一 Tab 缩进
+  - `main.cu`：被测内核表注册 `online_softmax_v1`（复用 `RowMap::kBlockPerRowShuffle`：`grid = rows`、smem = 0），同步 `RowMap` / `GridFor` / `SmemFor` / 边界场景注释的版本口径
+  - 全量回归 8 内核 × 20 场景 160 项全部通过（默认档 16 项通过），覆盖窄行空子集、warp 边界、`N=0` 空行等路径
+  - `operators/softmax/README.md`：状态表 / 版本规划 / 参考规模 / 目录布局与测试 / 场景说明补 online-v1；online 开发采样表替换为 v0 / v1 同场实测（online-v1 4096² 0.6945 ms / 193.25 GB/s、16384×1024 0.8156 ms / 164.56 GB/s，max_err 1.329e-06 / 1.285e-06；online-v0 同场复测 3.9611 / 3.7119 ms，替换更早的同日采样）
+  - 顶层 `README.md` / `AGENTS.md`：Softmax 状态同步为进行中（v0/v1/v2/v3/v4/v5 与 online-v0/v1 完成，全量回归 160 项通过）
 - 2026-09-10 09:20 `operators/softmax`：新增 online softmax 独立实现单元并接入测试
   - `online_softmax.cuh`：新增 online softmax 接口声明与设计说明 —— “online” 指单趟在线归约：用「运行最大 m + 运行分母 d」二元组在同一趟遍历里增量维护行最大与 Σexp（`m' = max(m,x)`、`d' = d*exp(m-m') + exp(x-m')`），求 m 与求 Σexp 合并为一趟全局读；声明 `online_softmax_v0`（每行一个 block、`grid = M`、块内 warp shuffle 合并、无动态共享内存、`blockDim.x` 为 32 的倍数且 <= 1024）
   - `online_softmax.cu`：新增 `online_softmax_v0` 实现 —— 每线程以 stride 在线归约本线程子集；`warpMergeOnline` / `blockMergeOnline` 两级 warp shuffle 合并各线程 `(m,d)`（空子集以 `d == 0` 识别、合并时跳过，规避 `-inf - (-inf)` 的 NaN 传播），结果经静态 `__shared__` 广播回全体；第三次遍历重算 exp 归一化写回（全局读 2 遍 + 写 1 遍）。因 `-rdc=false` 无法跨翻译单元引用 `__device__`，该单元自带合并 helper、与 `softmax.cu` 的归约 helper 并列

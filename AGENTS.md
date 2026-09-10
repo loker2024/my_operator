@@ -11,7 +11,7 @@ CUDA 基础算子学习与实验仓库（MIT）。目标算子：**Softmax、GEM
 | 算子 | 状态 | 版本 |
 |---|---|---|
 | Reduce | 完成 | v0…v7，全量回归 80 项通过 |
-| Softmax | 进行中 | v0/v1/v2/v3/v4/v5 与 online-v0 完成，全量回归 140 项通过 |
+| Softmax | 进行中 | v0/v1/v2/v3/v4/v5 与 online-v0/v1 完成，全量回归 160 项通过 |
 | GEMM / Attention | 骨架规划中 | 无 `src/main.cu`，configure 自动跳过 |
 
 ## 1. 环境与构建
