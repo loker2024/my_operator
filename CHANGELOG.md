@@ -34,6 +34,12 @@
 
 ### Changed
 
+- 2026-09-10 11:10 全仓库严格基准采样口径下调（面向 RTX 4060 Laptop）
+  - `docs/benchmark-methodology.md` §3.2/§3.4：严格档由 1000 预热 + 21 组 × 10000 次下调为 100 预热 + 21 组 × 1000 次（总 2.1 万次调用，约 1/10），并说明下调原因（慢内核整表严格基准耗时过长）
+  - `AGENTS.md` §5：默认迭代建议同步为严格对比 100 预热 + 21 组 × 1000 次
+  - `operators/softmax/src/test.cu`、`operators/reduce/src/test.cu`：严格档参数同步下调（保留 21 组以维持 P5/P95 分位分辨率）
+  - `operators/softmax/src/test.cuh`、`operators/reduce/src/test.cuh`：严格采样注释同步
+  - `operators/softmax/README.md`、`operators/reduce/README.md`、`operators/reduce/notes/reduce.md`：开关说明与计时口径同步；reduce 结论记录表数字标注为旧口径实测（中位数不受采样密度显著影响）
 - 2026-09-10 09:28 全仓库源码统一 `clang-format` 格式化并校正风格文档
   - 对 `common/`、`demo/`、`operators/{reduce,softmax}` 全部自有源文件执行 `clang-format -i --style=file`（排除 `build/`、`.venv/`）：旧文件原为 2 空格缩进，现统一为 `.clang-format` 规定的 Tab 缩进 + 行宽 100 重排，无语义变化
   - 修正 `AGENTS.md` §6 风格描述：`IndentWidth 2` → `IndentWidth 4` + `UseTab: ForIndentation`，与仓库 `.clang-format` 实际取值一致

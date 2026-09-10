@@ -19,7 +19,7 @@
 //                        block 全补 0、不影响结果，由 main.cu 的 GridFor 计算）
 //   block                每 block 线程数（2 的幂，默认 256）
 //   strict_benchmark     严格采样开关：false（默认）1 次预热 + 100 次迭代；
-//                        true 时 1000 次预热 + 21 组 × 10000 次并输出 P5/P95
+//                        true 时 100 次预热 + 21 组 × 1000 次并输出 P5/P95
 //
 // 返回：正确性通过返回 true（供 main 汇总并决定退出码）。
 bool test_reduce_kernel(ReduceKernel kernel, const char* kernel_name, int n, int grid, int block,

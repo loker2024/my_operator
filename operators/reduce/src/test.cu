@@ -11,9 +11,11 @@
 
 bool test_reduce_kernel(ReduceKernel kernel, const char* kernel_name, int n, int grid, int block,
                         bool strict_benchmark) {
-	// 迭代口径：开发（默认）vs 严格两档，见 docs/benchmark-methodology.md。
-	const int warmup_iterations = strict_benchmark ? 1000 : 1;
-	const int iterations = strict_benchmark ? 10000 : 100;
+	// 迭代口径：开发（默认）vs 严格两档，见 docs/benchmark-methodology.md。严格档
+	// 面向本机 RTX 4060 Laptop 调低采样量（100 预热 + 21 组 × 1000 次），21 组保留
+	// P5/P95 分位分辨率。
+	const int warmup_iterations = strict_benchmark ? 100 : 1;
+	const int iterations = strict_benchmark ? 1000 : 100;
 	const int sample_count = strict_benchmark ? 21 : 1;
 
 	// 契约防御：非法参数判 FAIL 而非崩溃（n<0 无意义，cudaMalloc(d_output, 0) 未定义）。
