@@ -1,4 +1,4 @@
-// online_softmax.cu —— online_softmax.cuh 的实现：online_softmax_v0/v1（单趟在线归约）。
+// online_softmax.cu —— online_softmax.cuh 的实现：online_softmax_v0/v1/v2（单趟在线归约）。
 // 接口契约 / 启动约束见 online_softmax.cuh，推导与实测见 README.md。
 
 #include <cmath>  // expf / fmaxf / INFINITY
@@ -130,5 +130,65 @@ __global__ void online_softmax_v1(const float* input, float* output, const int M
 	const float inv_d = 1.0f / d;
 	for (int i = tid; i < N; i += blockDim.x) {
 		y[i] = expf(x[i] - m) * inv_d;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// online_softmax_v2 —— v1 + float4 向量化（列宽为 4 的倍数时）
+// ---------------------------------------------------------------------------
+// 行映射 / 启动约束同 v1，见 online_softmax.cuh 的 v2 声明（含“非 4 倍列宽为何整行
+// 回退标量”的说明）。与 v1 的差异仅在行内访问：N % 4 == 0 时行首 16 B 对齐，单趟
+// 在线归约与写回都以 float4 为单位 stride 扫行（每轮 4 列、读/写指令数为标量 1/4，
+// 4 分量逐一 mergeOnline），否则整行走 v1 式标量两遍。
+__global__ void online_softmax_v2(const float* input, float* output, const int M, const int N) {
+	const int row = blockIdx.x;  // 每 block 处理一行
+	if (row >= M) return;        // 空矩阵 / 超配 grid：越界行空转
+	const int tid = threadIdx.x;
+
+	const float* x = input + row * N;
+	float* y = output + row * N;
+
+	float m = -INFINITY;
+	float d = 0.0f;
+
+	if (N % 4 == 0) {
+		// 列宽为 4 的倍数：行首 16 B 对齐，float4 主循环（每轮 stride 处理 4 列；
+		// 空行 N == 0 时 n4 == 0，两遍循环 0 次、不读不写）
+		const int n4 = N / 4;
+		const float4* x4 = reinterpret_cast<const float4*>(x);
+		float4* y4 = reinterpret_cast<float4*>(y);
+
+		// ① 一趟 float4 stride 扫行：4 分量逐一插入在线归约 → 块内 shuffle 合并
+		for (int i = tid; i < n4; i += blockDim.x) {
+			const float4 v = x4[i];
+			mergeOnline(m, d, v.x, 1.0f);
+			mergeOnline(m, d, v.y, 1.0f);
+			mergeOnline(m, d, v.z, 1.0f);
+			mergeOnline(m, d, v.w, 1.0f);
+		}
+		blockReduceOnline(m, d);
+
+		// ② 第二趟 float4 读行重算 exp(x - m) / d 并整写回（无标量尾部）
+		const float inv_d = 1.0f / d;
+		for (int i = tid; i < n4; i += blockDim.x) {
+			const float4 v = x4[i];
+			y4[i] = make_float4(expf(v.x - m) * inv_d, expf(v.y - m) * inv_d, expf(v.z - m) * inv_d,
+			                    expf(v.w - m) * inv_d);
+		}
+	} else {
+		// 列宽非 4 的倍数：行首不保证 16 B 对齐，整行回退标量两遍（语义同 v1）
+		// ① 一趟 stride 扫行：每线程在线归约自己的列子集 → 块内两级 shuffle 合并出
+		//    整行 (m, d)（求 m 与求 Σexp 合并为一趟全局读）
+		for (int i = tid; i < N; i += blockDim.x) {
+			mergeOnline(m, d, x[i], 1.0f);  // 插入单元素：该元素自身基准下的分母为 1
+		}
+		blockReduceOnline(m, d);
+
+		// ② 第二趟读行重算 exp(x - m) / d 写回（不缓存整行，exp 每元素算 2 次）。
+		//    空行 N == 0：d == 0 → inv_d == inf，但循环 0 次、不写任何元素
+		const float inv_d = 1.0f / d;
+		for (int i = tid; i < N; i += blockDim.x) {
+			y[i] = expf(x[i] - m) * inv_d;
+		}
 	}
 }

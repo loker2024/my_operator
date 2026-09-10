@@ -9,9 +9,10 @@
 //   分母：m' = max(m, x)、d' = d * exp(m - m') + exp(x - m')（d 先按新旧基准之差
 //   缩放回新基准，再加新元素贡献），把求 m 与求 Σexp 合并为一趟全局读。
 //
-//   单元内两个版本的差别只在行内/块内的协作方式：v0 每线程独占一行（无协作），
-//   v1 每行一个 block、块内两级 warp shuffle 合并各线程的 (m, d)（读合并，是
-//   后续「分块 + 在线合并」的 FlashAttention 形态的雏形）。
+//   单元内各版本的差别只在行内 / 块内的协作方式与访存宽度：v0 每线程独占一行
+//   （无协作），v1 每行一个 block、块内两级 warp shuffle 合并各线程的 (m, d)
+//   （读合并，是后续「分块 + 在线合并」的 FlashAttention 形态的雏形），v2 在 v1
+//   基础上按列宽分派 float4 向量化（仅影响行内访问宽度，归约与启动约束同 v1）。
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -37,3 +38,16 @@ __global__ void online_softmax_v0(const float* input, float* output, const int M
 //     作归约单位元参与合并 —— 合并时须跳过该侧的缩放，否则 (-inf) - (-inf) 的
 //     NaN 会经 expf 污染整行分母；N == 0 的空行不读不写。
 __global__ void online_softmax_v1(const float* input, float* output, const int M, const int N);
+
+// online_softmax_v2 行遍历与归约同 v1（每行一个 block、单趟在线归约 + 两级 warp
+//   shuffle 合并、无动态共享内存），行内访问按列宽分派以支持任意列宽：
+//   * N % 4 == 0：行首必然 16 B 对齐（row*N 为 4 的倍数），单趟在线归约与写回的
+//     主循环每轮 stride 取 1 个 float4（4 列，逐分量 mergeOnline / 算 exp 后整写
+//     回）—— 读/写指令数为标量的 1/4，无标量尾部；
+//   * 否则：整行回退 v1 式标量两遍 —— 非 4 倍列宽时第 row>=1 行的行首 16 B 不
+//     对齐，float4 重解释是未定义行为，尾列处理救不了跨行对齐（正确性不受影响，
+//     仅无向量化收益）；
+//   * 启动约束同 v1：row = blockIdx.x、grid = M（M == 0 时也须 >= 1，由 row >= M
+//     越界空转）、blockDim.x 为 32 的倍数且 <= 1024；smem_bytes = 0；N == 0 的空行
+//     不读不写。
+__global__ void online_softmax_v2(const float* input, float* output, const int M, const int N);

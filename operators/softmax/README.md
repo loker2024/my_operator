@@ -21,11 +21,12 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
 | CUDA | v5 | v4 前身思路接入：全局读 2 遍 + float4 —— 动态共享内存只缓存 exp（不再缓存 x），以多读 1 遍全局换掉 v4 的 x smem 写/读往返，exp 仍只算 1 次 | 完成（已接入测试） |
 | CUDA | online-v0 | online softmax：每线程处理一行（`row = blockIdx.x * blockDim.x + threadIdx.x`，`grid = ceil(M/block)`），单趟在线归约 —— 用「运行最大 m + 运行分母 d」二元组在同一趟遍历里增量维护行最大与 Σexp（`m' = max(m,x)`、`d' = d*exp(m-m') + exp(x-m')`），求 m 与 Σexp 合并为一趟全局读；第二趟读行重算 `exp(x-m)/d` 写回；无共享内存 | 完成（已接入测试） |
 | CUDA | online-v1 | online softmax 块内协作版：每行一个 block（`row = blockIdx.x`，`grid = rows`），行内 `blockDim.x` 个线程以 stride 单趟在线归约各自列子集的 `(m, d)`，再由两级 warp shuffle 合并出整行二元组（`mergeOnline` 以 `m == -inf` 识别空子集并跳过缩放，规避 `(-inf)-(-inf)` 的 NaN）；第二趟读行重算 `exp(x-m)/d` 写回；无共享内存，`blockDim.x` 为 32 的倍数且 <= 1024 | 完成（已接入测试） |
+| CUDA | online-v2 | online-v1 + `float4` 向量化：列宽为 4 的倍数（行首 16 B 对齐）时，单趟在线归约与写回的主循环每轮 stride 取 1 个 `float4`（4 分量逐一 `mergeOnline` / 算 exp 后 16 B 整写回），读/写指令数为标量 1/4；否则整行回退标量 —— 任意列宽均正确 | 完成（已接入测试） |
 | Triton | t0 | 与 CUDA 同规格的 Triton 实现 | 规划中 |
 | Triton | t1 | 与 CUDA 性能对照并记录 | 规划中 |
 
 - 正确性判据：相对误差 ≤ 1e-5（逐元素，跳过 `|ref| < 1e-30` 的元素，见 `docs/benchmark-methodology.md`）。
-- 指标：有效带宽 =（输入读 + 输出写）/ 中位耗时，其中输入输出按**逻辑数据量**各计 1 次（每元素 4 B 读 + 4 B 写）。内核实际可能多次读行（v0 每元素读 3 次、online-v0/v1 读 2 次 —— v0 与 online-v0 访存不合并、online-v1 合并；v2/v3 读 3 遍、v4 读 1 遍、v5 读 2 遍），低效会直接反映为更低的有效带宽，便于横向比较。
+- 指标：有效带宽 =（输入读 + 输出写）/ 中位耗时，其中输入输出按**逻辑数据量**各计 1 次（每元素 4 B 读 + 4 B 写）。内核实际可能多次读行（v0 每元素读 3 次、online-v0/v1/v2 读 2 次 —— v0 与 online-v0 访存不合并、online-v1/online-v2 合并；v2/v3 读 3 遍、v4 读 1 遍、v5 读 2 遍），低效会直接反映为更低的有效带宽，便于横向比较。
 
 ## 版本规划说明
 
@@ -107,12 +108,20 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
   合并，合并时须跳过该侧缩放 —— 否则 `(-inf) - (-inf)` 的 NaN 会经 `expf` 污染整行
   分母（列宽 3 等窄行场景必现，本次修复的实测缺陷）；另需 `warp_m[32]` 写后 /
   `final_*` 读前各一次 `__syncthreads`。
+- **online-v2 块内协作 + float4（已实现并接入测试）**：行映射 / 归约语义 / 启动约束
+  同 online-v1，仅把行内访问按列宽分派 —— 列宽为 4 的倍数（`row*N` 为 4 的倍数 →
+  行首 16 B 对齐）时，单趟在线归约与写回的主循环每轮 stride 取 1 个 `float4`（4 分量
+  逐一 `mergeOnline` / 算 `exp` 后 16 B 整写回），读/写指令数为标量的 1/4；否则整行
+  回退 online-v1 式标量两遍（非 4 倍列宽时第 `row>=1` 行的行首不再 16 B 对齐，
+  `float4` 重解释是未定义行为，尾列处理救不了跨行对齐）。任意列宽均正确，向量化
+  收益限于对齐宽行。实测见结论记录：4096×4096 同场 189.10 GB/s、宽行 16384×1024
+  177.55 GB/s，相对 online-v1 的 164.51 / 161.57 GB/s 分别提升 ~14.9% / ~9.9%。
 
 ## 参考规模
 
 - 默认：`rows=4096, cols=4096`（fp32，约 64 MiB 输入）。
 - 可选：`rows=16384, cols=1024`（宽行场景）。
-- block 大小默认 256（v0 与 online-v0：`grid = ceil(rows/block)`，每线程处理一行；v1/v2/v3/v4/v5 与 online-v1：`grid = rows`，行内由 256 个线程协作；v2/v3/v4/v5 与 online-v1 另要求 32 的倍数且 <= 1024；v4/v5 额外要求动态共享内存 `N * sizeof(float)` 不超上限，见状态表与版本规划）。
+- block 大小默认 256（v0 与 online-v0：`grid = ceil(rows/block)`，每线程处理一行；v1/v2/v3/v4/v5 与 online-v1/online-v2：`grid = rows`，行内由 256 个线程协作；v2/v3/v4/v5 与 online-v1/online-v2 另要求 32 的倍数且 <= 1024；v4/v5 额外要求动态共享内存 `N * sizeof(float)` 不超上限，见状态表与版本规划）。
 
 ## 目录布局与测试
 
@@ -120,27 +129,28 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
 softmax/
 ├── README.md   # 本文档：规划 + 结论总表
 ├── CMakeLists.txt  # 构建脚本（src/main.cu 存在即自动启用）
-└── src/        # CUDA 实现（当前 v0/v1/v2/v3/v4/v5 与 online-v0/v1，后续版本追加进对应 .cuh/.cu）
+└── src/        # CUDA 实现（当前 v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2，后续版本追加进对应 .cuh/.cu）
     ├── softmax.cuh / softmax.cu   # 算子接口与实现：v0~v5（被测试对象）
-    ├── online_softmax.cuh / .cu   # 独立实现单元：online softmax 单趟在线归约（online-v0/v1）
+    ├── online_softmax.cuh / .cu   # 独立实现单元：online softmax 单趟在线归约（online-v0/v1/v2）
     ├── test.cuh  / test.cu        # 可复用测试驱动：正确性(容差1e-5)+性能
-    └── main.cu                    # 执行入口：注册 v0~v5 与 online-v0/v1，运行测试
+    └── main.cu                    # 执行入口：注册 v0~v5 与 online-v0/v1/v2，运行测试
 ```
 
 > 注：`triton/` 与 `notes/` 属规划目录，尚未创建。
 
 测试入口 `src/main.cu` 将 `softmax_v0` ~ `softmax_v5` 与 `online_softmax_v0` /
-`online_softmax_v1` 注册给同一测试驱动（`online_softmax_v0` / `v1` 为独立实现单元，
-见 `online_softmax.cuh`）。
+`online_softmax_v1` / `online_softmax_v2` 注册给同一测试驱动（`online_softmax_v0` /
+`v1` / `v2` 为独立实现单元，见 `online_softmax.cuh`）。
 因各版行映射与共享内存不同，`main.cu` 以 `RowMap` 描述各内核并按场景推出
 启动配置（见 `softmax.cuh` / `online_softmax.cuh` 各版本声明）：v0 每线程处理一行 →
 `grid = ceil(rows/block)`、无共享内存；v1 每行一个 block → `grid = rows`、动态共享内存
 `blockDim.x * sizeof(float)`；v2/v3 每行一个 block → `grid = rows`、
 无动态共享内存（内部仅静态 `__shared__` 中转；v3 的 `float4` 向量化只影响行内访问，
 启动配置同 v2）；online-v0 每线程处理一行 → `grid = ceil(rows/block)`、无共享内存
-（与 v0 同为 `RowMap::kThreadPerRow`，差别只在行内归约语义）；online-v1 每行一个
-block → 与 v2/v3 同为 `RowMap::kBlockPerRowShuffle`（`grid = rows`、无动态共享内存，
-内部仅静态 `__shared__` 中转）；v4/v5 每行一个 block →
+（与 v0 同为 `RowMap::kThreadPerRow`，差别只在行内归约语义）；online-v1/online-v2
+每行一个 block → 与 v2/v3 同为 `RowMap::kBlockPerRowShuffle`（`grid = rows`、无动态
+共享内存，内部仅静态 `__shared__` 中转；online-v2 的 `float4` 向量化只影响行内访问，
+启动配置同 online-v1）；v4/v5 每行一个 block →
 `grid = rows`、动态共享内存 `cols * sizeof(float)`（随列宽增长，`main.cu` 的 `SmemFor`
 需按列宽传入 —— v4 缓存整行 x、v5 缓存整行 exp）。
 每内核覆盖三类场景：
@@ -149,13 +159,13 @@ block → 与 v2/v3 同为 `RowMap::kBlockPerRowShuffle`（`grid = rows`、无�
 - **边界条件**：`1×1`，行数在 block 线程覆盖边界附近的 `(block±1)`、恰满载的
   `block`、末 block 仅余 1 行的 `(2*block-1)`（v0 与 online-v0 的关键路径，列宽 3），以及行宽在
   行内协作边界附近的 `3×(block±1)`、恰 1 轮满载的 `3×block`、第 2 轮仅余 1 列的
-  `3×(2*block-1)`、warp 边界附近的 `3×(32±1)` / `3×32`（v2/v3/v4/v5 与 online-v1 的
+  `3×(2*block-1)`、warp 边界附近的 `3×(32±1)` / `3×32`（v2/v3/v4/v5 与 online-v1/online-v2 的
   关键路径
   —— 覆盖
   空转线程、多轮 stride 与整 warp 空转的归约单位元路径，online-v1 在此走「空子集
   `(m = -inf, d = 0)` 参与二元组合并」的路径；其中非 4 倍列宽场景对
-  v3/v4/v5 走标量回退），以及 float4 对齐边界 `3×[4×(block±1)]` / `3×(4×block)` /
-  `3×[4×(2*block-1)]`（v3/v4/v5 向量化主循环在 block 线程数附近 —— 空转 / 恰 1 轮
+  v3/v4/v5 与 online-v2 走标量回退），以及 float4 对齐边界 `3×[4×(block±1)]` / `3×(4×block)` /
+  `3×[4×(2*block-1)]`（v3/v4/v5 与 online-v2 向量化主循环在 block 线程数附近 —— 空转 / 恰 1 轮
   满载 /
   第 2 轮余 1 个 / 余 `block-1` 个 `float4`，列宽均为 4 的倍数）；
 - **异常 / 健壮性**：`0×1024` 空矩阵（越界空转）、`3×0` 空行（遍历 0 次、不写）。
@@ -164,7 +174,7 @@ block → 与 v2/v3 同为 `RowMap::kBlockPerRowShuffle`（`grid = rows`、无�
 
 | 开关 | 默认 | 作用 |
 | --- | --- | --- |
-| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（8 内核共 160 项） |
+| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（9 内核共 180 项） |
 | `strict_benchmark` | `false` | 是否按严格口径采样（透传给 `test_softmax_kernel` 的同名参数，与 reduce 测试一致）：关闭时 1 次预热 + 100 次迭代；开启时 1000 次预热 + 21 组 × 10000 次并输出 P5/P95 |
 
 日常开发保持默认即可（只跑有性能意义的大规模形状）；出严格基准数字或做全量
@@ -222,19 +232,18 @@ cmake --build build --target softmax
 
 ### online softmax 开发采样（2026-09-10）
 
-下表为 `online_softmax_v0` / `v1` **同一次开发采样**（默认档：1 次预热 + 100 次迭代，
-`strict_benchmark=false`，2026-09-10 运行；online-v0 为本次同场复测，替换更早的同日
-采样 4096² 4.1289 ms / 32.51 GB/s、16384×1024 3.3539 ms / 40.02 GB/s —— 更早的
-0.7245 ms / 185.25 GB/s 属块内协作版，现已由 online-v1 承接）。它与上方 v0–v5 表
-**非同一次运行**，仅供量级参考、不与 v0–v5 逐项横比（同机同构建，单次采样波动
-约 ±10%）：
+下表为 `online_softmax_v0` / `v1` / `v2` **同一次开发采样**（默认档：1 次预热 + 100
+次迭代，`strict_benchmark=false`，2026-09-10 运行）。它与上方 v0–v5 表**非同一次
+运行**，仅供量级参考、不与 v0–v5 逐项横比（同机同构建，单次采样波动约 ±10%）：
 
 | 版本 | 形状 | 耗时 ms | 有效带宽 GB/s | max_err | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| online-v0 | 4096x4096 | 3.9611 | 33.88 | 5.488e-06 | 每线程一行，单趟在线归约、无共享内存 |
-| online-v0 | 16384x1024 | 3.7119 | 36.16 | 2.884e-06 | 宽行场景 |
-| online-v1 | 4096x4096 | 0.6945 | 193.25 | 1.329e-06 | 块内协作 + shuffle 合并，同场较 online-v0 约 5.7× |
-| online-v1 | 16384x1024 | 0.8156 | 164.56 | 1.285e-06 | 宽行场景，同场较 online-v0 约 4.6× |
+| online-v0 | 4096x4096 | 4.1441 | 32.39 | 5.488e-06 | 每线程一行，单趟在线归约、无共享内存 |
+| online-v0 | 16384x1024 | 3.7365 | 35.92 | 2.884e-06 | 宽行场景 |
+| online-v1 | 4096x4096 | 0.8159 | 164.51 | 1.329e-06 | 块内协作 + shuffle 合并，同场较 online-v0 约 5.1× |
+| online-v1 | 16384x1024 | 0.8307 | 161.57 | 1.285e-06 | 宽行场景，同场较 online-v0 约 4.5× |
+| online-v2 | 4096x4096 | 0.7098 | 189.10 | 1.341e-06 | float4 向量化，同场较 online-v1 +15.2%（带宽 +14.9%） |
+| online-v2 | 16384x1024 | 0.7560 | 177.55 | 1.392e-06 | 宽行场景，同场较 online-v1 +9.9%（带宽 +9.9%） |
 
 要点：online-v0 把「求行最大 + 求 Σexp」合并为一趟全局读（v2/v3 为两趟），全局流量
 = 读 2 遍 + 写 1 遍，且不占用共享内存（v4/v5 需 `cols * sizeof(float)` 缓存整行）；
@@ -242,8 +251,10 @@ cmake --build build --target softmax
 在线合并」场景。其带宽远低于 v2~v5（~180 GB/s）的原因在**每线程独占一整行**：warp
 内各线程读不同行、访存完全不合并（4096×4096 只有 4096 个线程、grid = 16，并行度也
 远低于块内协作版），而非在线归约本身；`max_err` 偏大（5.5e-06）则来自行内 fp32
-串行累加。online-v1 把行映射换成块内协作后即恢复合并访存：同场 193.25 / 164.56 GB/s，
-与 v2/v3 的 189.86 / 157.46 GB/s 同量级（非同场，仅作量级对照），`max_err` 也降到
-块内协作版的 1.3e-06 量级 —— 说明 online-v0 的差距来自访存模式而非在线归约。online
-相对 v2/v3 少读 1 遍行，但 exp 每元素要算 2 次（在线更新 + 写回各 1 次），当前形状下
-两者基本抵消；下一步可对齐 v3 的 `float4` 向量化 / 减少 exp 次数再看收益。
+串行累加。online-v1 把行映射换成块内协作后即恢复合并访存：同场 164.51 / 161.57 GB/s，
+`max_err` 也降到块内协作版的 1.3e-06 量级 —— 说明 online-v0 的差距来自访存模式而非
+在线归约。online-v2 再对齐 v3 的 `float4` 向量化（单趟在线归约与写回都按 `float4`
+读写），同场 189.10 / 177.55 GB/s，相对 online-v1 提升 ~15% / ~10%，与 v2/v3 的
+189.86 / 157.46 GB/s 同量级（非同场，仅作量级对照）—— 说明向量化在在线归约上同样
+有效。online 相对 v2/v3 少读 1 遍行，但 exp 每元素要算 2 次（在线更新 + 写回各 1 次），
+当前形状下两者基本抵消；下一步可评估减少 exp 次数的收益。

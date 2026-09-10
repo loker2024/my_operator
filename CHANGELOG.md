@@ -41,6 +41,13 @@
 
 ### Added
 
+- 2026-09-10 10:59 `operators/softmax`：新增并接入 `online_softmax_v2`（online-v1 + float4 向量化）
+  - `online_softmax.cu`：追加 v2 内核并修复草稿缺陷 —— 移除草稿遗留的 clang 内部头文件 include（原导致编译失败）、统一 `.clang-format` 规定的 Tab 缩进、写回改 `float4` 整写（原为标量写且 `y4` 声明未用）、补齐文件头版本清单与内核注释
+  - `online_softmax.cuh`：补 v2 声明与启动约束（列宽为 4 的倍数时行内以 `float4` 单趟在线归约 + 整写回，否则整行回退标量；启动约束同 v1），文件头补单元内 v0/v1/v2 差异
+  - `main.cu`：被测内核表注册 `online_softmax_v2`（复用 `RowMap::kBlockPerRowShuffle`：`grid = rows`、smem = 0），同步 `kBlock` / `RowMap` / `GridFor` / `SmemFor` / 边界场景注释的版本口径
+  - 全量回归 9 内核 × 20 场景 180 项全部通过（默认档 18 项通过），覆盖 float4 对齐边界、非 4 倍列宽标量回退、窄行空子集等路径
+  - `operators/softmax/README.md`：状态表 / 版本规划 / 参考规模 / 目录布局 / 测试章节补 online-v2，online 开发采样替换为 v0/v1/v2 同场实测（online-v2 4096² 0.7098 ms / 189.10 GB/s、16384×1024 0.7560 ms / 177.55 GB/s，max_err 1.341e-06 / 1.392e-06；同场相对 online-v1 +15.2% / +9.9%）
+  - 顶层 `README.md` / `AGENTS.md`：Softmax 状态同步为进行中（v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2 完成，全量回归 180 项通过）
 - 2026-09-10 10:25 `operators/softmax`：新增并接入 `online_softmax_v1`（块内协作版在线归约）
   - `online_softmax.cuh`：补 v1 声明与启动约束（每行一个 block、`row = blockIdx.x`、`grid = M`、`blockDim.x` 为 32 的倍数且 <= 1024、无动态共享内存；未分到元素的线程 / warp 以 `(m = -inf, d = 0)` 作归约单位元），文件头补单元内 v0 / v1 的行映射差异
   - `online_softmax.cu`：补 v1 注释并修复草稿缺陷 —— 提取 `mergeOnline`（二元组结合运算，空集一侧跳过缩放以规避 `(-inf)-(-inf)` 经 `expf` 污染整行分母）、`warpReduceOnline` / `blockReduceOnline` 两级 shuffle 合并并补齐「warp 值写入后」「结果广播前」两处 `__syncthreads`、补 `row >= M` 越界空转守卫；移除草稿遗留的 clang 内部头文件 include 并按 `.clang-format` 统一 Tab 缩进
