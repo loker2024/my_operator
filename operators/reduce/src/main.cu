@@ -13,7 +13,9 @@
 
 #include <cstddef>  // std::size_t
 #include <cstdio>   // printf / std::snprintf
+#include <cstring>  // std::strcmp
 
+#include "operator_common/BenchConfig.h"
 #include "operator_common/cuda_check.h"
 #include "reduce.cuh"
 #include "test.cuh"
@@ -138,19 +140,42 @@ bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
 
 }  // namespace
 
-int main() {
-	// 开关集中在此，默认关闭：只跑正常流程 + 快速性能。需要全量回归或严格基准时
-	// 改为 true。
-	constexpr bool kEnableBoundary = false;
-	constexpr bool kStrictBenchmark = false;
+int main(int argc, char** argv) {
+	// 命令行开关（默认开发档：只跑正常流程 + 快速性能；口径见
+	// docs/benchmark-methodology.md）：
+	//   --boundary 追加 [B] 边界条件 / [C] 异常与健壮性场景（全量回归）
+	//   --strict   启用严格采样口径（采样量按设备算力分档）
+	//   --full     等价于 --boundary --strict（全量回归 + 严格基准）
+	bool enable_boundary = false;
+	bool strict_benchmark = false;
+	for (int i = 1; i < argc; ++i) {
+		if (std::strcmp(argv[i], "--boundary") == 0) {
+			enable_boundary = true;
+		} else if (std::strcmp(argv[i], "--strict") == 0) {
+			strict_benchmark = true;
+		} else if (std::strcmp(argv[i], "--full") == 0) {
+			enable_boundary = true;
+			strict_benchmark = true;
+		} else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
+			std::printf("用法: %s [--boundary] [--strict] [--full]\n", argv[0]);
+			return 0;
+		} else {
+			std::printf("未知参数: %s\n用法: %s [--boundary] [--strict] [--full]\n", argv[i], argv[0]);
+			return 2;
+		}
+	}
 
 	PrintDeviceInfo();
 	std::printf("\n");
 
+	const StrictBenchConfig strict = MakeStrictBenchConfig();
 	std::printf("==== Reduce 测试：正确性(容差 1e-3) + 性能 ====\n");
 	std::printf("block = %d；被测内核 %zu 个\n", kBlock, sizeof(kKernels) / sizeof(kKernels[0]));
+	std::printf("严格档采样: %d 次预热 + %d 组 x %d 次（基准 %d SM，本机 %d SM）\n",
+	            strict.warmup_iterations, strict.sample_count, strict.iterations,
+	            kBenchRefSmCount, BenchDeviceSmCount());
 	std::printf("开关: enable_boundary = %s, strict_benchmark = %s\n\n",
-	            kEnableBoundary ? "true" : "false", kStrictBenchmark ? "true" : "false");
+	            enable_boundary ? "true" : "false", strict_benchmark ? "true" : "false");
 
 	bool all_ok = true;
 	int passed = 0;
@@ -158,7 +183,7 @@ int main() {
 
 	for (const KernelEntry& kern : kKernels) {
 		std::printf("---------------- %s ----------------\n", kern.name);
-		const bool ok = RunScenarios(kern, kEnableBoundary, kStrictBenchmark, &passed, &total);
+		const bool ok = RunScenarios(kern, enable_boundary, strict_benchmark, &passed, &total);
 		all_ok = ok && all_ok;
 		std::printf("\n");
 	}

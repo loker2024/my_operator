@@ -7,6 +7,7 @@
 #include <cstdio>     // printf
 #include <vector>     // std::vector
 
+#include "operator_common/BenchConfig.h"  // 严格档采样量按设备算力分档
 #include "operator_common/GpuTimer.h"    // 基于 CUDA event 的 GPU 计时
 #include "operator_common/cuda_check.h"  // CUDA_CHECK 错误检查宏
 #include "test.cuh"
@@ -14,12 +15,13 @@
 bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows, int cols,
                          int grid, int block, std::size_t smem_bytes, bool strict_benchmark) {
 	// 迭代口径：开发（默认）vs 严格两档，与 reduce 测试文件一致
-	// （见 docs/benchmark-methodology.md）。严格档面向本机 RTX 4060 Laptop 调低采样量
-	// （100 预热 + 21 组 × 1000 次，总 2.1 万次，约为原口径 1/10）：慢内核（如 v0
-	// 单次 ~5 ms）整表严格基准由数十分钟降到约十分钟，21 组保留 P5/P95 分位分辨率。
-	const int warmup_iterations = strict_benchmark ? 100 : 1;
-	const int iterations = strict_benchmark ? 1000 : 100;
-	const int sample_count = strict_benchmark ? 21 : 1;
+	// （见 docs/benchmark-methodology.md）。严格档采样量随设备算力分档（基准机
+	// RTX 4060 Laptop = 100 预热 + 21 组 × 1000 次，更强 GPU 按 SM 数放大，21 组
+	// 固定以保留 P5/P95 分辨率；见 operator_common/BenchConfig.h）。
+	const StrictBenchConfig strict = MakeStrictBenchConfig();
+	const int warmup_iterations = strict_benchmark ? strict.warmup_iterations : 1;
+	const int iterations = strict_benchmark ? strict.iterations : 100;
+	const int sample_count = strict_benchmark ? strict.sample_count : 1;
 
 	// 契约防御：非法参数判 FAIL 而非崩溃（rows/cols < 0 无意义，cudaMalloc(0)
 	// 未定义，grid/block < 1 无法启动）。
