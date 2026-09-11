@@ -7,6 +7,10 @@
 
 ### Fixed
 
+- 2026-09-11 14:20 `CMakeLists.txt`：CUDA toolkit 根目录兜底（软链 nvcc 场景）
+  - 当 PATH 中的 `nvcc` 是软链（如 `/usr/local/bin/nvcc` → `/usr/local/cuda-12.8/bin/nvcc`）时，CMake 会按软链所在目录把 toolkit 根误判为 `/usr/local`，导致 `find_package(CUDAToolkit)` 找不到 `include/cuda_runtime.h`、`enable_language(CUDA)` 报 `Couldn't find CUDA library root`
+  - 现先把 `nvcc` 解析为真实路径，仅当其上级目录确为 CUDA 安装根（含 `include/cuda_runtime.h`）时才设置 `CUDAToolkit_ROOT` 与 `CMAKE_CUDA_COMPILER`；解析不到保持原行为，用户显式指定时以用户为准
+  - 回归验证：`rm -rf build && cmake --preset release && cmake --build build` 在软链 nvcc 下全目标编译通过
 - 2026-09-08 13:16 文档与注释同步
   - 根 `README.md` 更新 Reduce 的 v0…v7 与 80 项全量回归状态
   - 补充未接入 CMake 的 `demo/` 说明
@@ -47,6 +51,14 @@
 
 ### Added
 
+- 2026-09-11 14:20 严格基准采样量按设备算力分档 + 入口命令行开关 + RTX 4090 全量严格基准存档
+  - `common/include/operator_common/BenchConfig.h`（新增）：严格档采样量由「写死次数」改为按当前设备 SM 数相对基准机（RTX 4060 Laptop，24 SM）分档 —— `tier = clamp(round(SM/24), 1, 10)`，`预热 100×tier` + `21 组 × 1000×tier` 次（21 组固定以保住 P5/P95 分位分辨率）；设备查询失败时回退基准档
+  - `operators/{reduce,softmax}/src/main.cu`：入口改为支持 `--boundary` / `--strict` / `--full`（等价 `--boundary --strict`）与 `-h/--help`，**默认仍是开发档**；启动时打印本机 SM 数与由此得到的实际采样参数
+  - `operators/{reduce,softmax}/src/test.cu`、`test.cuh`：严格档改用 `MakeStrictBenchConfig()`，注释同步为「按设备分档」
+  - `docs/benchmark-methodology.md` §3.2/§3.4、`AGENTS.md` §5、根 `README.md`、两个算子 `README.md`、`operators/reduce/notes/reduce.md`：口径与开关说明同步为「按设备分档 + 命令行开关」
+  - 新增 `benchmark/` 存档：`reduce-strict-rtx4090.txt`（全量回归 **80/80 PASS**）、`softmax-strict-rtx4090.txt`（**240/240 PASS**，20 场景 × 12 内核）、`profile-rtx4090/ptxas-resources-rtx4090.txt`（20 个内核的静态资源画像）、`profile-rtx4090/kernel-profile-rtx4090.txt`（内核级指标汇总）
+  - 实测（RTX 4090，128 SM → tier=5，500 次预热 + 21 组 × 5000 次）：reduce v7 对齐 0.0029 ms / 1424.50 GB/s（相对 v0 约 +4.1×）；softmax v1…v5 与 online-v1/v2/v4 在 4096×4096 上 ~918 GB/s（理论显存峰值 1008.1 GB/s 的约 91% —— 该形状工作集 128 MiB 已超 4090 的 72 MB L2）
+  - 注：本机 `ncu` 因容器权限（驱动 `RmProfilingAdminOnly: 1` 且容器缺 `CAP_SYS_ADMIN`）无法采集硬件计数器，profile 改用 ptxas 静态画像 + 运行时指标；原因与逐内核复跑方式记录在汇总文件第 5 节
 - 2026-09-10 13:50 `operators/softmax`：新增并接入 `online_softmax_v4`（grid-stride 多行处理 / 块复用 + 单趟在线归约 + float4）
   - `online_softmax.cu`：新增 v4 内核 —— 行映射由「每行一个 block」改为「每 block 经 grid-stride 循环处理多行」（`for (row = blockIdx.x; row < M; row += gridDim.x)`），复用同一份寄存器与静态 `__shared__`（`blockReduceOnline` 内部中转）；行内归约 / 访存逐项同 online-v2（单趟在线归约 + 两级 warp shuffle 合并、`N % 4 == 0` 时 float4 否则整行标量）；跨行复用共享内存的顺序由 `blockReduceOnline` 收尾 `__syncthreads` 保证，无需在循环末尾额外同步
   - `online_softmax.cuh`：补 v4 声明与启动约束（grid 由调用方给出、`blockDim.x` 为 32 的倍数且 <= 1024、无动态共享内存、`M == 0` / `N == 0` 空转、非 4 倍列宽整行标量回退），文件头补单元内 v4 说明

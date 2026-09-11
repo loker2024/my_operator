@@ -66,7 +66,7 @@ cmake --build build --target <算子名>    # 目标名 = 算子目录名，如 
 - 指标口径：延时型报 ms+吞吐；归约/Softmax 报**有效带宽**（输入读+输出写）/时间；GEMM 报 TFLOPS（2MNK/t）。
 - 记录模板必含：算子/版本、形状、设备、构建参数、预热/迭代次数、中位数+P5/P95、指标、正确性结果（见 benchmark-methodology.md §3.4）。
 - 对比限**同机同构建**；跨机器只比数量级。
-- 默认迭代建议：开发阶段预热 1 次测 100 轮；严格对比预热 100 次测 21 组×1000 次（面向本机 RTX 4060 Laptop 下调采样量，见 `docs/benchmark-methodology.md` §3.2）。
+- 默认迭代建议：开发阶段预热 1 次测 100 轮；严格对比用 `./build/operators/<算子名>/<算子名> --full` 运行，采样量**按设备算力分档**（基准机 RTX 4060 Laptop，24 SM → 预热 100 次测 21 组×1000 次；更强 GPU 按 `tier = clamp(round(SM/24), 1, 10)` 放大，见 `docs/benchmark-methodology.md` §3.2 与 `common/include/operator_common/BenchConfig.h`）。
 
 ## 6. 代码风格与注释
 

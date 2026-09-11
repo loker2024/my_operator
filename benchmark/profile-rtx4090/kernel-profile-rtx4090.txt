@@ -1,0 +1,147 @@
+# ============================================================================
+# 内核级 profile 汇总 —— RTX 4090 严格基准
+# 主机: autodl-container-8c7b45bd44-2551e443    时间: 2026-09-11 (CST)
+#
+# 数据来源
+#   静态资源 : benchmark/profile-rtx4090/ptxas-resources-rtx4090.txt
+#              (cmake -DCMAKE_CUDA_FLAGS="--ptxas-options=-v", Release, arch=89)
+#   运行时   : benchmark/reduce-strict-rtx4090.txt   (--full, 80/80 PASS)
+#              benchmark/softmax-strict-rtx4090.txt  (--full, 240/240 PASS)
+#
+# 注意: 本机硬件性能计数器 (ncu) 因容器权限不可用，故本文件不含 SM/DRAM 计数器
+#       指标；原因与复跑方式见第 5 节。
+# ============================================================================
+
+## 1. 环境与口径
+
+设备          : NVIDIA GeForce RTX 4090 (sm_89), 128 SM, 23.5 GB
+驱动 / CUDA   : 580.105.08 / CUDA 12.8.93
+理论峰值带宽  : 1008.1 GB/s   (2 × 10.501 GHz × 384 bit / 8，估算值)
+构建          : Release, block=256, CMAKE_CUDA_ARCHITECTURES=89
+严格档采样    : 500 次预热 + 21 组 × 5000 次
+                (tier=5，由 tier=clamp(round(SM/24),1,10) 得出；基准机 24 SM 为 100/21×1000)
+主指标        : 中位数；P5/P95 为波动区间
+有效带宽口径  : Reduce  = (读 n 个 float + 写 grid 个部分和) / 中位耗时
+                Softmax = (读 1 次 + 写 1 次) × rows × cols × 4 B / 中位耗时
+回归结果      : Reduce 8 内核 × 10 场景 = 80/80 PASS (容差 1e-3)
+                Softmax 12 内核 × 20 场景 = 240/240 PASS (容差 1e-5)
+
+## 2. 静态资源画像（ptxas -v，sm_89）
+
+### 2.1 Reduce
+
+| 内核 | 寄存器/线程 | 栈帧 | spill stores | spill loads | 静态 smem | barriers | cmem[0] |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| reduce_v0 | 22 | 0 B | 0 B | 0 B | — (动态 smem) | 1 | 372 B |
+| reduce_v1 | 12 | 0 B | 0 B | 0 B | — (动态 smem) | 1 | 372 B |
+| reduce_v2 | 11 | 0 B | 0 B | 0 B | — (动态 smem) | 1 | 372 B |
+| reduce_v3 | 10 | 0 B | 0 B | 0 B | — (动态 smem) | 1 | 372 B |
+| reduce_v4 | 11 | 0 B | 0 B | 0 B | — (动态 smem) | 1 | 372 B |
+| reduce_v5<256> | 12 | 0 B | 0 B | 0 B | — (动态 smem) | 1 | 372 B |
+| reduce_v6 | 16 | 0 B | 0 B | 0 B | 128 B | 1 | 372 B |
+| reduce_v7 | 16 | 0 B | 0 B | 0 B | 128 B | 1 | 372 B |
+
+说明：v0…v5 的块内归约经由 `extern __shared__`，属**动态**共享内存（`main.cu` 的
+`GridFor`/`smem_bytes` 按 `block × sizeof(float)` 传入），不体现在 ptxas 的静态 smem
+一列；v6/v7 改用两级 warp shuffle，静态 `__shared__ warp_results[32]` = 128 B。全部
+内核 0 栈帧、0 spill。
+
+### 2.2 Softmax
+
+| 内核 | 寄存器/线程 | 栈帧 | spill stores | spill loads | 静态 smem | barriers | cmem[0] |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| softmax_v0 | 25 | 0 B | 0 B | 0 B | —（无） | 0 | 376 B |
+| softmax_v1 | 18 | 0 B | 0 B | 0 B | —（动态 smem） | 1 | 376 B |
+| softmax_v2 | 19 | 0 B | 0 B | 0 B | 272 B | 1 | 376 B |
+| softmax_v3 | 28 | 0 B | 0 B | 0 B | 272 B | 1 | 376 B |
+| softmax_v4 | 26 | 0 B | 0 B | 0 B | 272 B | 1 | 376 B |
+| softmax_v5 | 29 | 0 B | 0 B | 0 B | 272 B | 1 | 376 B |
+| online_softmax_v0 | 32 | 0 B | 0 B | 0 B | —（无） | 0 | 376 B |
+| online_softmax_v1 | 19 | 0 B | 0 B | 0 B | 264 B | 1 | 376 B |
+| online_softmax_v2 | 26 | 0 B | 0 B | 0 B | 264 B | 1 | 376 B |
+| online_softmax_v3 | 63 | 0 B | 0 B | 0 B | 264 B | 1 | 376 B |
+| online_softmax_v3_false | 19 | **64 B** | 0 B | 0 B | 264 B | 1 | 376 B |
+| online_softmax_v4 | 30 | 0 B | 0 B | 0 B | 264 B | 1 | 376 B |
+
+说明：
+- `softmax_v0`（每线程独立处理一行、行内串行）与 `online_softmax_v0` 不使用共享内存，
+  故无静态 smem 且 `barriers = 0`；`softmax_v1` 经 `extern __shared__` 使用**动态**
+  共享内存（`block × sizeof(float)`，由 `main.cu` 的 `SmemFor` 传入），同样不计入静态
+  smem。
+- v2…v5 与 online-v1…v4 的 264–272 B 静态 `__shared__` 是 warp shuffle 合并后的广播
+  中转槽。
+- `online_softmax_v3` 的 **63 寄存器**为全场最高，与算子 README「寄存器压力使 SM 驻留
+  block 数下降、收益被占用损失抵消」的结论一致；`online_softmax_v3_false` 的
+  **64 B 栈帧**（= 16 槽 × sizeof(float)）正是运行期下标导致定长数组被降级到
+  local memory 的直接证据，两者互为对照。
+
+## 3. 内核级性能（正常流程，严格档 500 预热 / 21 组 × 5000 次，取中位数）
+
+### 3.1 Reduce（有效带宽 GB/s；max_err 全部为 0.000e+00）
+
+| 内核 | n=2^20 对齐 ms (P5/P95) | GB/s | n=2^20+1000 尾部非对齐 ms (P5/P95) | GB/s |
+| --- | --- | --- | --- | --- |
+| reduce_v0 | 0.0120 (0.0120/0.0126) | 350.59 | 0.0121 (0.0121/0.0121) | 348.83 |
+| reduce_v1 | 0.0078 (0.0078/0.0078) | 538.32 | 0.0078 (0.0078/0.0078) | 538.59 |
+| reduce_v2 | 0.0076 (0.0076/0.0076) | 555.83 | 0.0076 (0.0076/0.0076) | 556.00 |
+| reduce_v3 | 0.0048 (0.0048/0.0048) | 880.20 | 0.0048 (0.0048/0.0048) | 880.47 |
+| reduce_v4 | 0.0035 (0.0035/0.0035) | 1211.19 | 0.0035 (0.0035/0.0035) | 1211.70 |
+| reduce_v5 | 0.0034 (0.0034/0.0034) | 1249.54 | 0.0034 (0.0034/0.0034) | 1250.28 |
+| reduce_v6 | 0.0032 (0.0032/0.0032) | 1305.76 | 0.0032 (0.0032/0.0032) | 1301.71 |
+| reduce_v7 | 0.0029 (0.0029/0.0030) | 1424.50 | 0.0030 (0.0029/0.0030) | 1421.42 |
+
+### 3.2 Softmax（ms；GB/s；max_err 4096² / 16384×1024）
+
+| 内核 | 4096×4096 ms | GB/s | 16384×1024 ms | GB/s | max_err |
+| --- | --- | --- | --- | --- | --- |
+| softmax_v0 | 1.8293 | 73.37 | 0.7834 | 171.33 | 5.478e-06 / 2.537e-06 |
+| softmax_v1 | 0.1481 | 905.99 | 0.1465 | 916.41 | 1.231e-06 / 1.234e-06 |
+| softmax_v2 | 0.1480 | 906.79 | 0.1467 | 915.18 | 1.232e-06 / 1.244e-06 |
+| softmax_v3 | 0.1463 | 917.63 | 0.1462 | 918.31 | 1.255e-06 / 1.237e-06 |
+| softmax_v4 | 0.1468 | 914.15 | 0.1460 | 919.18 | 1.223e-06 / 1.237e-06 |
+| softmax_v5 | 0.1462 | 918.26 | 0.1461 | 918.85 | 1.223e-06 / 1.237e-06 |
+| online_softmax_v0 | 1.4361 | 93.46 | 0.6327 | 212.12 | 5.488e-06 / 2.884e-06 |
+| online_softmax_v1 | 0.1488 | 901.92 | 0.1459 | 919.93 | 1.329e-06 / 1.285e-06 |
+| online_softmax_v2 | 0.1467 | 914.83 | 0.1462 | 917.98 | 1.341e-06 / 1.392e-06 |
+| online_softmax_v3 | 0.1494 | 898.54 | 0.1532 | 875.83 | 1.329e-06 / 1.285e-06 |
+| online_softmax_v3_false | 0.1549 | 866.35 | 0.1488 | 901.89 | 1.329e-06 / 1.285e-06 |
+| online_softmax_v4 | 0.1467 | 915.10 | 0.1495 | 898.04 | 1.341e-06 / 1.392e-06 |
+
+P5/P95 的完整数值在各原始输出文件中；Softmax 各版本的分位区间极窄（多数 P5 = P95 =
+中位数，最大展宽 ≤ 0.0003 ms）。
+
+## 4. 观察
+
+1. **Reduce 全面 0 spill / 0 栈帧，寄存器 10–22**：v7 以 16 寄存器、128 B 静态 smem
+   达成最高有效带宽 1424.50 GB/s，相对 v0 提升约 4.1×，与算子 README 记录的瓶颈迁移
+   主线（分歧 → 归约同步 → 全局访存）一致。
+2. **Reduce 的带宽数字不可当显存带宽看**：n=2^20 工作集仅 4 MiB，远小于 4090 的 72 MB
+   L2，预热后输入驻留片上，1424 GB/s 反映的是 **L2 命中带宽**（> 理论显存峰值
+   1008.1 GB/s 即为佐证）。结论仅用于同规模横向对比，与算子 README 的带宽可比性警示
+   一致。
+3. **Softmax 的 64 MiB 输入 + 64 MiB 输出 = 128 MiB 已超过 72 MB L2**，因此
+   4096×4096 上 ~918 GB/s 更接近**显存带宽**，已达理论峰值 1008 GB/s 的约 91%——
+   该形状下 v1…v5 与 online-v1/v2/v4 已全部贴着带宽上限，版本间差异落在
+   0.146–0.150 ms 的窄带内，进一步优化的空间主要在 v0/online-v0（每线程一行、
+   访存不合并）而非这些版本。
+4. **online_softmax_v3 的 63 寄存器与 online_softmax_v3_false 的 64 B 栈帧**在
+   RTX 4090 上得到与 RTX 4060 Laptop 一致的相对关系（v3 宽行 875.83 GB/s 略低于
+   v3_false 的 901.89 GB/s），说明该结论与设备无关，源于寄存器/占用权衡本身。
+
+## 5. 附录：ncu 硬件计数器不可用（原因与复跑方式）
+
+现象：`ncu` 报 `ERR_NVGPUCTRPERM`，连 `--section LaunchStats` 这类不依赖计数器的
+section 也在权限检查阶段被拦截，不产出任何报告。
+
+原因：驱动侧 `/proc/driver/nvidia/params` 中 `RmProfilingAdminOnly: 1`，而容器内进程
+缺少 `CAP_SYS_ADMIN`（`CapEff = 0xa80425fb`，bit 21 = 0）；`/sys/module/nvidia/parameters/`
+下不存在对应可写项，容器内无法解除。
+
+待宿主侧开启计数器权限（`NVreg_RestrictProfilingToAdminOnly=0` 或给容器
+`CAP_SYS_ADMIN`）后，可按内核逐个复跑（每次只剖该内核的首次启动，产出 `.ncu-rep`
+可用 `ncu-ui` 打开）：
+
+    ncu -k 'regex:^<内核名>$' -c 1 --set detailed \
+        -o benchmark/profile-rtx4090/ncu/<内核名> --force-overwrite \
+        --log-file benchmark/profile-rtx4090/ncu/<内核名>.txt \
+        ./build/operators/<算子名>/<算子名>

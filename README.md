@@ -48,6 +48,7 @@ my_operator/
 │       └── src/                # CUDA 实现：reduce.cuh/.cu、test.cuh/.cu、main.cu
 ├── docs/
 │   └── benchmark-methodology.md # 正确性验证与性能基准的统一口径
+├── benchmark/                  # 严格基准存档：完整终端输出 + ncu profile（按 GPU 命名）
 ├── demo/                       # 独立 CUDA 学习示例（不接入顶层 CMake）
 ├── CMakeLists.txt
 ├── CMakePresets.json           # 一条命令完成 Release/Debug 配置
@@ -71,6 +72,9 @@ operators/<name>/
 - CMake ≥ 3.24
 - Ninja（推荐）与支持 C++17 的编译器（gcc / clang / MSVC）
 
+严格基准另在远程 **RTX 4090**（同属 sm_89，128 SM，CUDA 12.8）上复跑，完整终端输出与
+`ncu` profile 存于 `benchmark/`。
+
 ## 构建与运行
 
 每个算子目录都自带 `CMakeLists.txt` 且已被顶层注册，但**只有目录里出现 `src/main.cu` 才会真正启用**（否则 configure 时自动跳过，不影响其他算子）。实现一个算子的流程：
@@ -86,6 +90,15 @@ cmake --build build --target softmax reduce   # 目标名 = 算子目录名
 ```
 
 运行该可执行文件即执行该算子的「正确性验证 + 性能基准」，打印通过/失败与耗时统计（失败时返回非零退出码，便于脚本化）。
+
+入口支持命令行开关：默认只跑正常流程 + 快速采样；加 `--full` 则执行**全量回归
+（含边界 / 异常场景）+ 严格采样**（采样量按当前 GPU 的 SM 数分档，见
+`docs/benchmark-methodology.md` §3.2）：
+
+```bash
+./build/operators/reduce/reduce --full
+./build/operators/softmax/softmax --full
+```
 
 `demo/` 保留三个可单独用 `nvcc` 编译的学习示例：`helloWorld.cu` 用于最小 CUDA
 启动验证，`demo_utils.cu` 演示向量加法、页锁定内存与统一计时工具，
