@@ -111,3 +111,23 @@ __global__ void softmax_v5(const float* input, float* output, const int M, const
 // softmax 内核统一签名（仅输出约定一致；启动配置随内核版本由 main.cu 给出）
 // ---------------------------------------------------------------------------
 using SoftmaxKernel = void (*)(const float* input, float* output, int M, int N);
+
+// ---------------------------------------------------------------------------
+// 可选：厂商库（cuDNN）对照参考
+// ---------------------------------------------------------------------------
+// 参考实现不是 __global__ 内核（主机 API，内部自行启动计算），无法用 SoftmaxKernel
+// 表示，故单列一个签名：参数与 SoftmaxKernel 同序，语义为「返回后 output[0, M*N)
+// 已写好」，供 test.cu 的 host_kernel 通道驱动。实现只在 -DSOFTMAX_WITH_CUDNN=ON 时
+// 编译（见 CMakeLists.txt）；类型别名恒可见，使测试驱动的该参数在未启用时也成立。
+using SoftmaxHostKernel = void (*)(const float* input, float* output, int M, int N);
+
+#ifdef SOFTMAX_WITH_CUDNN
+// softmax_cudnn —— 用 cuDNN 的 cudnnSoftmaxForward 算逐行 softmax，语义同 softmax_cpu
+//   * 算法取 CUDNN_SOFTMAX_ACCURATE（先减行最大再算，即本仓库 v0~v5 / online 系列的
+//     max-shift），模式取 CUDNN_SOFTMAX_MODE_INSTANCE（张量映射见 softmax.cu）；
+//   * M <= 0 或 N <= 0 直接返回（空矩阵 / 空行无元素可算）；
+//   * 句柄与张量描述符在首次调用时创建、之后复用，调用方不必管理生命周期；非线程
+//     安全（仅按单线程测试驱动使用）；
+//   * 与调用方同用默认流，故与 cudaMemcpy / CUDA event 计时天然有序（见实现注释）。
+void softmax_cudnn(const float* input, float* output, int M, int N);
+#endif

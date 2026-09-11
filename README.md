@@ -87,6 +87,16 @@ cmake --build build --target softmax reduce   # 目标名 = 算子目录名
 
 运行该可执行文件即执行该算子的「正确性验证 + 性能基准」，打印通过/失败与耗时统计（失败时返回非零退出码，便于脚本化）。
 
+构建开关（与上方流程无关）：
+
+- `-DSOFTMAX_WITH_CUDNN`（**默认开启**）：让 softmax 额外编译并链接一段厂商库 cuDNN
+  对照参考（`cudnnSoftmaxForward`），复用同一套判据与计时口径。cuDNN 需单独安装，CMake
+  会自动探测（也可用 `-DCUDNN_ROOT=<根目录>` 指定）；未装 cuDNN 时用
+  `-DSOFTMAX_WITH_CUDNN=OFF` 关闭，否则 configure 会直接报错。该选项值会被 CMake 缓存，
+  且 `option()` 的默认值只在首次 configure 写入，缓存里是 OFF 时须显式传 `=ON` 才生效。
+  **是否真的运行**该对照段由 `main.cu` 的 `kEnableCudnnReference` 决定。细节见
+  `operators/softmax/README.md`。
+
 `demo/` 保留三个可单独用 `nvcc` 编译的学习示例：`helloWorld.cu` 用于最小 CUDA
 启动验证，`demo_utils.cu` 演示向量加法、页锁定内存与统一计时工具，
 `demo_stream.cu` 演示 grid-stride 循环与多 stream 传输/计算流水。它们不属于

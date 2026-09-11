@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- 2026-09-11 16:36 softmax：接入 cuDNN 厂商库对照参考（`-DSOFTMAX_WITH_CUDNN`，默认开启）
+  - `operators/softmax/CMakeLists.txt`：新增 `SOFTMAX_WITH_CUDNN` 选项，按 `-DCUDNN_ROOT` > 环境变量 `CUDNN_ROOT` > `CONDA_PREFIX` > `/usr/local/cuda`、`/usr` > pip 版 `nvidia-cudnn-cu12`（`site-packages/nvidia/cudnn`）的顺序探测；pip / conda 版只提供带 SONAME 的 `libcudnn.so.9`（无 `libcudnn.so` 软链、不在 `ldconfig` 视界内），`find_library` 匹配不到时用 `file(GLOB)` 兜底，并写入 rpath 免设 `LD_LIBRARY_PATH`；选项默认开启（本机已装 cuDNN），未装时用 `-DSOFTMAX_WITH_CUDNN=OFF` 关闭，否则 configure 直接报错提示 `-DCUDNN_ROOT`
+  - `operators/softmax/src/softmax.cuh` / `.cu`：新增 `SoftmaxHostKernel` 别名与 `softmax_cudnn`（`cudnnSoftmaxForward` + `CUDNN_SOFTMAX_ACCURATE` + `CUDNN_SOFTMAX_MODE_INSTANCE`），把行主序 `M×N` 映射为 `[n=M, c=1, h=1, w=N]` + `nStride=N`；句柄与张量描述符进程内复用、绑定默认流，`M <= 0 || N <= 0` 直接返回，错误经 `SOFTMAX_CUDNN_CHECK` 打印后终止
+  - `operators/softmax/src/test.cuh` / `.cu`：`test_softmax_kernel` 新增可选参数 `host_kernel`，非空时改由主机 API 驱动（`kernel` / `grid` / `block` / `smem_bytes` 忽略），正确性判据与计时口径与内核路径完全一致
+  - `operators/softmax/src/main.cu`：`SOFTMAX_WITH_CUDNN` 下在被测内核之后追加 cuDNN 对照段（经 `host_kernel` 通道、不注册进 `kKernels`），复用 A/B/C 场景组；另加运行开关 `kEnableCudnnReference`（默认 `true`）与 `enable_boundary` / `strict_benchmark` 并列放在 `main()` —— CMake 选项只决定“编不编、链不链”（链接期依赖，值由 CMake 缓存），本开关决定“跑不跑”，置 `false` 时打印「已跳过」并跳过该段
+  - 回归验证：`-DSOFTMAX_WITH_CUDNN=OFF` 档 24/24 PASS；`=ON` 档 26/26 PASS，开启 `enable_boundary` 后 260/260 PASS（13 组 × 20 场景）；`kEnableCudnnReference=false` 时该段打印「已跳过」且回到 24/24。同场对照：cuDNN 0.6865 ms / 195.50 GB/s（4096²）、0.6889 ms / 194.83 GB/s（16384×1024），`max_err` 1.231e-06 / 1.234e-06 —— 与自研块内归约各版同档
+  - 开关默认值由 `OFF` 改为 `ON`：本机已装 cuDNN，默认 `build/` 重新 configure 后回归 26/26 PASS；源码注释与文档一并改为「默认开启 + 未装时用 `=OFF` 关闭」，并补记 `option()` 默认值只在首次 configure 写入、缓存里是 `OFF` 时须显式传 `=ON` 的陷阱
+  - 文档同步：`operators/softmax/README.md`（状态表新增「参考 / cuDNN」行、目录布局、开关表新增 `kEnableCudnnReference` 行并说明与 CMake 选项的分工、构建与运行新增 cuDNN 对照小节的开关用法与缓存说明、结论记录新增「cuDNN 厂商库对照」同场表）与根 `README.md`（构建与运行新增 `-DSOFTMAX_WITH_CUDNN` 构建开关说明）
+
 ### Fixed
 
 - 2026-09-08 13:16 文档与注释同步

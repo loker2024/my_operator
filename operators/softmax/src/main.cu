@@ -8,6 +8,11 @@
 // 复用全部测试场景 —— RowMap 给出该内核的行映射，由 GridFor/SmemFor 推出每个场景
 // 的启动配置（见 softmax.cuh 各版本）。
 //
+// 可选段：cuDNN 对照参考（厂商库 cudnnSoftmaxForward，实现见 softmax.cu）分两层开关
+// —— CMake 的 -DSOFTMAX_WITH_CUDNN=ON 决定“是否编译与链接 cuDNN”（链接期依赖，须在
+// 构建前定，值由 CMake 缓存），main() 的 kEnableCudnnReference 决定“链接后跑不跑”。
+// 它走主机 API、不是可注册的内核，故不进入 kKernels。
+//
 // 构建：cmake --build build --target softmax && ./build/operators/softmax/softmax
 // ============================================================================
 
@@ -230,6 +235,12 @@ int main() {
 	// 改为 true。
 	constexpr bool kEnableBoundary = false;
 	constexpr bool kStrictBenchmark = false;
+#ifdef SOFTMAX_WITH_CUDNN
+	// cuDNN 对照参考的运行开关（只在 -DSOFTMAX_WITH_CUDNN=ON 的构建里存在，见
+	// CMakeLists.txt）：true 跑对照段并与自研内核同场对照，false 跳过。CMake 选项
+	// 配一次即可（值会缓存），此后只改这里。
+	constexpr bool kEnableCudnnReference = true;
+#endif
 
 	PrintDeviceInfo();
 	std::printf("\n");
@@ -247,8 +258,13 @@ int main() {
 	std::printf("block = %d；被测内核 %zu 个\n", kBlock, sizeof(kKernels) / sizeof(kKernels[0]));
 	std::printf("grid-stride 上限 = min(rows, %d SM × %d) = %d block（online-v4）\n", sm_count,
 	            kGridStrideBlocksPerSm, g_grid_stride_blocks);
-	std::printf("开关: enable_boundary = %s, strict_benchmark = %s\n\n",
+	std::printf("开关: enable_boundary = %s, strict_benchmark = %s\n",
 	            kEnableBoundary ? "true" : "false", kStrictBenchmark ? "true" : "false");
+#ifdef SOFTMAX_WITH_CUDNN
+	std::printf("      cudnn_reference = %s（cuDNN 对照参考段）\n",
+	            kEnableCudnnReference ? "true" : "false");
+#endif
+	std::printf("\n");
 
 	bool all_ok = true;
 	int passed = 0;
@@ -260,6 +276,48 @@ int main() {
 		all_ok = ok && all_ok;
 		std::printf("\n");
 	}
+
+#ifdef SOFTMAX_WITH_CUDNN
+	// cuDNN 对照参考（跑不跑由上面的 kEnableCudnnReference 决定，能否编译进来取决于
+	// 构建时的 -DSOFTMAX_WITH_CUDNN=ON）：跑同一批场景、复用同一套 1e-5 判据与计时
+	// 口径，用于与自研内核做同场量级 / 性能对照。它不注册进 kKernels（主机 API、内部
+	// 自行启动，无 RowMap 概念），故按场景组单列一段。
+	// 注意：ACCURATE 与本仓库内核的累加顺序不同，max_err 只作量级对照（见 README）。
+	if (kEnableCudnnReference) {
+		constexpr const char* kCudnnName = "cudnn_softmax (ACCURATE, MODE_INSTANCE)";
+		const auto run_cudnn = [&](const char* title, const Scenario* scenarios, size_t count) {
+			std::printf("== %s ==\n", title);
+			for (size_t i = 0; i < count; ++i) {
+				char full_name[192];
+				std::snprintf(full_name, sizeof(full_name), "%s | %s", kCudnnName,
+				              scenarios[i].label);
+				// grid / block / smem 对主机 API 无意义，填合法值即可（见 test.cuh）。
+				const bool ok =
+				    test_softmax_kernel(nullptr, full_name, scenarios[i].rows, scenarios[i].cols, 1,
+				                        kBlock, 0, kStrictBenchmark, softmax_cudnn);
+				all_ok = ok && all_ok;
+				passed += ok ? 1 : 0;
+				total += 1;
+			}
+		};
+
+		std::printf(
+		    "---------------- [参考] cuDNN cudnnSoftmaxForward (ACCURATE) ----------------\n");
+		run_cudnn("[A] 正常流程", kNormalScenarios, CountOf(kNormalScenarios));
+		if (kEnableBoundary) {
+			run_cudnn("[B] 边界条件", kBoundaryScenarios, CountOf(kBoundaryScenarios));
+			run_cudnn("[C] 异常与健壮性", kAbnormalScenarios, CountOf(kAbnormalScenarios));
+		} else {
+			std::printf("== [B] 边界条件 / [C] 异常与健壮性 ==\n");
+			std::printf("    已跳过（enable_boundary = false，默认关闭）\n");
+		}
+		std::printf("\n");
+	} else {
+		std::printf(
+		    "---------------- [参考] cuDNN cudnnSoftmaxForward (ACCURATE) ----------------\n");
+		std::printf("    已跳过（kEnableCudnnReference = false）\n\n");
+	}
+#endif
 
 	// 正确性全部通过则退出码 0，否则 1（便于脚本化判断）。
 	std::printf("==== 结果：%d/%d 项 PASS，%s ====\n", passed, total,

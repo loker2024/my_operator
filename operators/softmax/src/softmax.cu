@@ -1,10 +1,18 @@
 // softmax.cu —— softmax.cuh 声明的实现：CPU 参考 + softmax_v0/v1/v2/v3/v4/v5 内核。
 // 接口契约 / 启动约束 / 版本差异见 softmax.cuh，推导与实测见 README.md。
+// 末尾可选实现 softmax_cudnn（厂商库对照参考，-DSOFTMAX_WITH_CUDNN=ON 才编译）。
 
 #include <cmath>    // expf / fmaxf / INFINITY / std::exp
 #include <cstddef>  // std::size_t
 
 #include "softmax.cuh"
+
+#ifdef SOFTMAX_WITH_CUDNN
+#include <cudnn.h>  // 可选参考实现：cuDNN 主机 API
+
+#include <cstdio>   // std::fprintf（本文件的 cuDNN 错误检查）
+#include <cstdlib>  // std::abort
+#endif
 
 // softmax_cpu —— 主机端参考（测试的正确性基线）
 void softmax_cpu(const float* input, float* output, int M, int N) {
@@ -31,6 +39,72 @@ void softmax_cpu(const float* input, float* output, int M, int N) {
 		}
 	}
 }
+
+// ===========================================================================
+// 可选：cuDNN 对照参考（-DSOFTMAX_WITH_CUDNN=ON 才编译，见 CMakeLists.txt）
+// ===========================================================================
+#ifdef SOFTMAX_WITH_CUDNN
+namespace {
+
+// 进程内单例：句柄与张量描述符只建一次。描述符创建/重设是主机侧开销，而 test.cu 的
+// 事件计时覆盖整个迭代循环的墙钟区间，放进循环会污染与内核的对照。
+struct CudnnCtx {
+	cudnnHandle_t handle = nullptr;
+	cudnnTensorDescriptor_t desc = nullptr;
+	int rows = -1;  // desc 当前描述的形状；换形状时才重设
+	int cols = -1;
+};
+
+// 与 cuda_check.h 的 CUDA_CHECK 同风格：失败即打印状态码与调用点并终止 —— 对照参考
+// 若带错返回，后面的正确性结论全部不可信。
+#define SOFTMAX_CUDNN_CHECK(expr)                                                               \
+	do {                                                                                        \
+		const cudnnStatus_t st__ = (expr);                                                      \
+		if (st__ != CUDNN_STATUS_SUCCESS) {                                                     \
+			std::fprintf(stderr, "cuDNN error %s (%d) at %s:%d in %s: %s\n",                    \
+			             cudnnGetErrorString(st__), static_cast<int>(st__), __FILE__, __LINE__, \
+			             __func__, #expr);                                                      \
+			std::abort();                                                                       \
+		}                                                                                       \
+	} while (0)
+
+}  // namespace
+
+// softmax_cudnn —— 契约见 softmax.cuh 的声明。实现要点：
+//   * cuDNN 按 NCHW 理解数据、没有「行主序矩阵」这种输入形式，需显式给 stride 映射：
+//     [n=M, c=1, h=1, w=N] + nStride=N —— 第 r 行落在 input + r*N，c/h 退化为单元素。
+//     配 MODE_INSTANCE（对每个 n 在 C·H·W = N 上归一）即逐行 softmax；若误用
+//     MODE_CHANNEL，在 C=1 的映射下每个元素自成一「通道」，归一化退化为恒等。
+//   * ACCURATE 已含 max-shift，与本仓库内核数值稳定性同档；两者累加顺序不同，故只做
+//     量级与性能对照，不作为逐元素精确基准（见 README）。
+//   * x/y 形状相同，共用同一描述符，省一次创建。
+void softmax_cudnn(const float* input, float* output, int M, int N) {
+	if (M <= 0 || N <= 0) return;  // 空矩阵 / 空行：无元素可算（cuDNN 不接受 0 维张量）
+
+	static CudnnCtx ctx;  // C++11 起函数内 static 初始化线程安全；本实现按单线程使用
+	if (ctx.handle == nullptr) {
+		SOFTMAX_CUDNN_CHECK(cudnnCreate(&ctx.handle));
+		SOFTMAX_CUDNN_CHECK(cudnnCreateTensorDescriptor(&ctx.desc));
+		// 显式绑默认流：调用方（test.cu）的 cudaLaunchKernel / cudaMemcpy / 计时
+		// event 都走默认流，同流使执行与计时天然有序。
+		SOFTMAX_CUDNN_CHECK(cudnnSetStream(ctx.handle, nullptr));
+	}
+
+	if (ctx.rows != M || ctx.cols != N) {
+		SOFTMAX_CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(
+		    ctx.desc, CUDNN_DATA_FLOAT, /*n=*/M, /*c=*/1, /*h=*/1, /*w=*/N, /*nStride=*/N,
+		    /*cStride=*/N, /*hStride=*/N, /*wStride=*/1));
+		ctx.rows = M;
+		ctx.cols = N;
+	}
+
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	SOFTMAX_CUDNN_CHECK(cudnnSoftmaxForward(ctx.handle, CUDNN_SOFTMAX_ACCURATE,
+	                                        CUDNN_SOFTMAX_MODE_INSTANCE, &alpha, ctx.desc, input,
+	                                        &beta, ctx.desc, output));
+}
+#endif  // SOFTMAX_WITH_CUDNN
 
 // softmax_v0 —— 每线程处理一行，行内串行三遍（正确性基线）
 __global__ void softmax_v0(const float* input, float* output, const int M, const int N) {

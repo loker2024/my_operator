@@ -30,8 +30,13 @@
 //                         均随列宽增长）
 //   strict_benchmark      严格采样开关：false（默认）1 次预热 + 100 次迭代；
 //                         true 时 100 次预热 + 21 组 × 1000 次并输出 P5/P95
+//   host_kernel           可选的主机 API 驱动（如 cuDNN 对照参考，见 softmax.cuh 的
+//                         SoftmaxHostKernel）。非 nullptr 时改由它在主机侧自行启动
+//                         计算，此时 kernel / grid / block / smem_bytes 全部忽略
+//                         （rows/cols 的合法性检查仍生效），正确性判据与计时口径与
+//                         内核路径完全一致 —— 便于同场对照。
 //
 // 返回：正确性通过返回 true（供 main 汇总并决定退出码）。
 bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows, int cols,
-                         int grid, int block, std::size_t smem_bytes,
-                         bool strict_benchmark = false);
+                         int grid, int block, std::size_t smem_bytes, bool strict_benchmark = false,
+                         SoftmaxHostKernel host_kernel = nullptr);

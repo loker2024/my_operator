@@ -12,7 +12,8 @@
 #include "test.cuh"
 
 bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows, int cols,
-                         int grid, int block, std::size_t smem_bytes, bool strict_benchmark) {
+                         int grid, int block, std::size_t smem_bytes, bool strict_benchmark,
+                         SoftmaxHostKernel host_kernel) {
 	// 迭代口径：开发（默认）vs 严格两档，与 reduce 测试文件一致
 	// （见 docs/benchmark-methodology.md）。严格档面向本机 RTX 4060 Laptop 调低采样量
 	// （100 预热 + 21 组 × 1000 次，总 2.1 万次，约为原口径 1/10）：慢内核（如 v0
@@ -65,6 +66,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
 	// 被测内核的映射给出（v0 无动态共享内存 smem_bytes = 0；v1 为 blockDim.x 个
 	// float；v2/v3 = 0 —— 仅用内部静态 __shared__ 中转；v4/v5 为 cols 个 float ——
 	// v4 缓存整行 x、v5 缓存整行 exp，随列宽增长）。
+	// host_kernel 非空时走主机 API 通道（如 cuDNN 对照参考，见 test.cuh），它自行
+	// 启动计算，上面的启动配置只作为未使用参数存在。
 	const dim3 grid_dim(grid);
 	const dim3 block_dim(block);
 	const float* d_input_arg = d_input;
@@ -73,6 +76,10 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
 	int cols_arg = cols;
 	void* args[] = {&d_input_arg, &d_output_arg, &rows_arg, &cols_arg};
 	auto launch = [&]() {
+		if (host_kernel != nullptr) {
+			host_kernel(d_input_arg, d_output_arg, rows_arg, cols_arg);
+			return;
+		}
 		CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), grid_dim, block_dim,
 		                            args, smem_bytes));
 	};

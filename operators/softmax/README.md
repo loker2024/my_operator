@@ -25,6 +25,7 @@ y_ij = exp(x_ij - m_i) / Σ_j exp(x_ij - m_i)
 | CUDA | online-v3 | 寄存器分片缓存：行映射 / 归约 / 启动约束同 online-v1/v2，每线程元素数 `ceil(N/blockDim.x) <= REG_TILE`（16）时，第 1 遍在线归约的同时把本线程负责的列缓存进**编译期定长、静态下标**的寄存器数组（`#pragma unroll` 整体展开，`ptxas -v` 实测 0 stack frame / 0 spill），写回遍直接取寄存器、省掉第 2 遍全局读；超过分片容量（block=256 时 `N > 4096`）自动回退 online-v1/v2 式两遍重读 —— 任意列宽均正确 | 完成（已接入测试；实测低于 online-v1/v2，见结论记录） |
 | CUDA | online-v3_false | online-v3 的反面对照：行映射 / 归约 / 启动约束同 online-v3，仅把寄存器分片的写法由「编译期定长 + 静态下标 `reg[k]`（真寄存器）」换成「运行期下标 `reg_cache[count++]`」—— 寄存器不可被运行期索引，ptxas 把该定长数组整体降级为 **local memory**（`ptxas -v` 实测 `64 bytes stack frame` = 16 槽 float 数组；数组名叫 reg 但并未落在寄存器，即「假寄存器」）。写回遍同样免掉第 2 遍全局读，代价是每次存取走 local memory（物理显存、仅靠 L1 缓存）。**不做列宽分派、无回退路径**：始终缓存，要求 `ceil(N/blockDim.x) <= 16`（block = 256 时 `N <= 4096`），超过则越界（由调用方保证） | 完成（已接入测试；实测宽行明显领先 online-v3、4096² 基本持平，见结论记录） |
 | CUDA | online-v4 | grid-stride 多行处理（块复用）+ 全优化集成：行映射由「每行一个 block」改为「每 block 经 grid-stride 循环处理多行」（`row = blockIdx.x; row < M; row += gridDim.x`，`grid = min(rows, SM 数 × 32)`），每个 block 复用同一份寄存器 / 静态 `__shared__` 连续处理多行，省掉多余 block 的调度 / 建立开销；行内归约与访存逐项同 online-v2（单趟在线归约 + 两级 warp shuffle 合并、按列宽分派 `float4`） | 完成（已接入测试；实测与 online-v2 持平，见结论记录） |
+| 参考 | cuDNN | 厂商库对照（非被测内核）：`cudnnSoftmaxForward` + `CUDNN_SOFTMAX_ACCURATE` + `CUDNN_SOFTMAX_MODE_INSTANCE`，实现为 `softmax.cu` 的 `softmax_cudnn`，经测试驱动的 host_kernel 通道复用同一套判据与计时口径；构建时由 `-DSOFTMAX_WITH_CUDNN` 决定编不编、链不链（默认开启，未装 cuDNN 时用 `=OFF` 关闭） | 完成（已接入测试；正确性与性能均与自研内核同档，见结论记录） |
 | Triton | t0 | 与 CUDA 同规格的 Triton 实现 | 规划中 |
 | Triton | t1 | 与 CUDA 性能对照并记录 | 规划中 |
 
@@ -185,7 +186,7 @@ softmax/
 ├── README.md   # 本文档：规划 + 结论总表
 ├── CMakeLists.txt  # 构建脚本（src/main.cu 存在即自动启用）
 └── src/        # CUDA 实现（当前 v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4，后续版本追加进对应 .cuh/.cu）
-    ├── softmax.cuh / softmax.cu   # 算子接口与实现：v0~v5（被测试对象）
+    ├── softmax.cuh / softmax.cu   # 算子接口与实现：v0~v5（被测试对象）+ 可选 cuDNN 对照参考
     ├── online_softmax.cuh / .cu   # 独立实现单元：online softmax 单趟在线归约（online-v0/v1/v2/v3/v3_false/v4）
     ├── test.cuh  / test.cu        # 可复用测试驱动：正确性(容差1e-5)+性能
     └── main.cu                    # 执行入口：注册 v0~v5 与 online-v0/v1/v2/v3/v3_false/v4，运行测试
@@ -234,15 +235,17 @@ online-v1）；online-v4 每 block 经 grid-stride 循环处理多行 →
   上限）覆盖；
 - **异常 / 健壮性**：`0×1024` 空矩阵（越界空转）、`3×0` 空行（遍历 0 次、不写）。
 
-开关（均为 `RunScenarios` 的函数参数，**默认关闭**，在 `main()` 中集中设置）：
+开关（在 `main()` 中集中设置）：
 
 | 开关 | 默认 | 作用 |
 | --- | --- | --- |
-| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（12 内核共 240 项） |
+| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景（经 `RunScenarios` 透传）；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（12 内核共 240 项；叠加 cuDNN 对照参考后为 13 组共 260 项） |
 | `strict_benchmark` | `false` | 是否按严格口径采样（透传给 `test_softmax_kernel` 的同名参数，与 reduce 测试一致）：关闭时 1 次预热 + 100 次迭代；开启时 100 次预热 + 21 组 × 1000 次并输出 P5/P95 |
+| `kEnableCudnnReference` | `true` | 是否运行 cuDNN 对照参考段（该常量只在 `SOFTMAX_WITH_CUDNN` 打开的构建里存在）。与 CMake 选项分工：**CMake 选项决定“编不编、链不链”**（链接期依赖，须构建前定），**本开关决定“跑不跑”**；CMake 的值会被缓存（`option()` 默认值只在首次 configure 写入，缓存里是 `OFF` 时须显式传 `=ON`），配一次之后日常只改这里 |
 
-日常开发保持默认即可（只跑有性能意义的大规模形状）；出严格基准数字或做全量
-回归时，把 `main()` 中对应常量改为 `true`。
+日常开发保持前两个默认即可（只跑有性能意义的大规模形状）；出严格基准数字或做全量
+回归时，把 `main()` 中对应常量改为 `true`；想临时去掉 cuDNN 对照段则把
+`kEnableCudnnReference` 改为 `false`（无需重新 configure）。
 
 构建与运行（仓库根目录）：
 
@@ -251,6 +254,30 @@ cmake --preset release
 cmake --build build --target softmax
 ./build/operators/softmax/softmax
 ```
+
+接厂商库 cuDNN 做对照参考（`SOFTMAX_WITH_CUDNN` **默认开启**，未装 cuDNN 时关掉）：
+
+```bash
+cmake --preset release                             # 默认即开启
+cmake --build build --target softmax
+./build/operators/softmax/softmax
+
+cmake --preset release -DSOFTMAX_WITH_CUDNN=OFF    # 未装 cuDNN 时关闭（否则 configure 报错）
+```
+
+开启后 `main.cu` 会在被测内核之后追加一段 cuDNN 参考（`cudnnSoftmaxForward`，
+`ACCURATE` + `MODE_INSTANCE`，实现见 `softmax.cu` 的 `softmax_cudnn`），经测试驱动的
+`host_kernel` 通道复用**同一套 1e-5 判据与计时口径**，全量回归由 240 项变为 260 项。
+该 CMake 选项只决定“编不编、链不链”，**跑不跑**由 `main()` 的 `kEnableCudnnReference`
+决定（见上方开关表）；选项值会被 CMake 缓存，而 `option()` 的默认值只在**首次**
+configure 时写入 —— `build/` 若曾在关闭状态下 configure 过，改默认值不生效，须显式传
+`-DSOFTMAX_WITH_CUDNN=ON` 重新 configure（此后日常只改 `main.cu` 即可）。
+cuDNN 不属于 CUDA Toolkit，需单独获取；构建时按 `-DCUDNN_ROOT=<根目录>` > 环境变量
+`CUDNN_ROOT` > `CONDA_PREFIX` > `/usr/local/cuda`、`/usr` > pip 版 `nvidia-cudnn-cu12`
+（PyTorch 的依赖，落在 `site-packages/nvidia/cudnn` 下，含头文件与 `libcudnn.so.9`）
+的顺序自动探测，找不到时直接报错提示 `-DCUDNN_ROOT`。注意 pip / conda 版只提供带
+SONAME 版本号的 `libcudnn.so.9`（无 `libcudnn.so` 软链、不在 `ldconfig` 视界内），
+CMake 已做 glob 兜底并写入 rpath，运行时**无需**设置 `LD_LIBRARY_PATH`。
 
 ## 结论记录
 
@@ -471,3 +498,45 @@ grid = min(rows, 24 SM × 32) = 768（4096×4096 每 block 约 5.3 行、16384×
 在本算子当前形状下**不构成性能来源**。其价值在通用性：`rows` 极大（如百万行）时可用
 固定上限的 grid 启动而无需启动 `rows` 个 block；这也是仓库 reduce-v7 用 grid-stride
 扫描的同一动机。
+
+### cuDNN 厂商库对照（2026-09-11）
+
+`-DSOFTMAX_WITH_CUDNN=ON` 接入的厂商库参考（cuDNN 9.10.2 的 `cudnnSoftmaxForward`，
+`CUDNN_SOFTMAX_ACCURATE` + `CUDNN_SOFTMAX_MODE_INSTANCE`）与全部 12 个自研内核
+**同一次运行**（默认档：`enable_boundary=true` + `strict_benchmark=false`，1 次预热 +
+100 次迭代，2026-09-11），全量 13 组 × 20 场景 = **260/260 PASS**：
+
+| 内核 | 4096×4096 ms | GB/s | 16384×1024 ms | GB/s | max_err（4096² / 16384×1024） |
+| --- | --- | --- | --- | --- | --- |
+| v0（每线程一行, 串行三遍） | 5.0464 | 26.60 | 3.7257 | 36.02 | 5.478e-06 / 2.537e-06 |
+| v1（块内树形归约） | 0.7078 | 189.63 | 0.6604 | 203.23 | 1.231e-06 / 1.234e-06 |
+| v2（warp shuffle 归约） | 0.6813 | 197.01 | 0.6470 | 207.45 | 1.232e-06 / 1.244e-06 |
+| v3（float4 向量化） | 0.6828 | 196.56 | 0.6977 | 192.38 | 1.255e-06 / 1.237e-06 |
+| v4（整行 smem 缓存 x） | 0.6939 | 193.44 | 0.6717 | 199.83 | 1.223e-06 / 1.237e-06 |
+| v5（读 2 遍 float4, smem 存 exp） | 0.6721 | 199.70 | 0.6766 | 198.38 | 1.223e-06 / 1.237e-06 |
+| online-v0（每线程一行, 单趟在线） | 3.8292 | 35.05 | 3.5457 | 37.85 | 5.488e-06 / 2.884e-06 |
+| online-v1（在线 + 两级 shuffle） | 0.6921 | 193.93 | 0.6687 | 200.71 | 1.329e-06 / 1.285e-06 |
+| online-v2（在线 + float4） | 0.6844 | 196.12 | 0.6747 | 198.93 | 1.341e-06 / 1.392e-06 |
+| online-v3（在线 + 寄存器分片） | 0.7246 | 185.22 | 1.0804 | 124.23 | 1.329e-06 / 1.285e-06 |
+| online-v3_false（假寄存器） | 0.7244 | 185.28 | 0.8212 | 163.45 | 1.329e-06 / 1.285e-06 |
+| online-v4（grid-stride 多行） | 0.6842 | 196.17 | 0.7246 | 185.22 | 1.341e-06 / 1.392e-06 |
+| **cudnn_softmax（ACCURATE, MODE_INSTANCE）** | 0.6865 | 195.50 | 0.6889 | 194.83 | 1.231e-06 / 1.234e-06 |
+
+要点：
+
+1. **正确性同档**：cuDNN 的 `max_err` 为 1.231e-06 / 1.234e-06，与同场 `v1` 逐位相同，
+   也落在块内归约各版（v1~v5、online-v1~v4）的 1.2–1.4e-06 带内，远低于 1e-5 容差 ——
+   说明自研内核的数值稳定性已与厂商库持平。`ACCURATE` 与本仓库同为 max-shift，但累加
+   顺序不同，故该列只作**量级对照**，不作为逐元素精确基准（精确基准始终是 `softmax_cpu`
+   的主机 double 参考）。
+2. **性能同档**：195.50 / 194.83 GB/s 落在 12 个自研内核的同一条带内（除 v0 /
+   online-v0 两个串行基线外为 185–207 GB/s），4096² 上比同场最快的 `v5`（199.70 GB/s）
+   低 2.1%、比 `v2`（197.01）低 0.8%；宽行上与 `v2`（207.45）差 6.1%。该算子访存受限，
+   厂商库同样受显存带宽约束，没有留出额外余量。
+3. **小形状上暴露主机侧开销**：cuDNN 走主机 API（描述符复用 + 提交），1×1 场景
+   0.0121 ms、边界小形状普遍 0.012–0.016 ms，是一条约 12 µs 的**固定调用底噪**（内核版
+   同场为 0.009–0.020 ms）；大形状上被 0.69 ms 的计算摊薄，不影响上面的对照结论。
+4. **模式映射是易错点**：本算子把行主序 `M×N` 映射为 `[n=M, c=1, h=1, w=N]` +
+   `nStride=N`，必须配 `MODE_INSTANCE`（对每个 `n` 在 `C·H·W = N` 上归一）；若误用
+   `MODE_CHANNEL`，在 `C=1` 的映射下每个元素自成一「通道」，归一化退化为恒等 —— 详见
+   `softmax.cu` 的实现注释。
