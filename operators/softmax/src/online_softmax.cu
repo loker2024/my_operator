@@ -197,18 +197,14 @@ __global__ void online_softmax_v2(const float* input, float* output, const int M
 // ---------------------------------------------------------------------------
 // online_softmax_v3 —— v1/v2 的归约框架 + 寄存器分片缓存（真正落在寄存器）
 // ---------------------------------------------------------------------------
-// 行映射 / 归约 / 启动约束见 online_softmax.cuh 的 v3 声明。与 v1/v2 的差异只在
-// 写回遍的 x 来源：每线程元素数 <= kRegTile（列宽可被单 block 一轮扫完）时，第 1 遍
-// 在线归约的同时把本线程负责的列缓存进寄存器数组，写回遍直接取寄存器、省掉第 2 遍
-// 全局读；列宽过大、寄存器分片装不下时自动回退 v1/v2 式两遍重读。
+// 行映射 / 归约 / 启动约束见 online_softmax.cuh 的 v3 声明。与 v1/v2 的差异只在写回
+// 遍的 x 来源：每线程元素数 <= kRegTile 时缓存本线程列、写回遍取寄存器、省掉第 2 遍
+// 全局读；超容量时自动回退 v1/v2 式两遍重读。
 //
-// 真寄存器的关键（对照朴素的 reg_cache[count++] 被 ptxas 降级为 local memory）：
-//   * 循环上界 kRegTile 是编译期常量、循环体无运行期计数 → #pragma unroll 整体展开；
-//   * 展开后下标 k 是常量，reg[k] 静态寻址 —— 寄存器不可被运行期索引，只有静态下标
-//     才留在寄存器；若改用 i（运行期列号）或 count++ 作下标必退化为 local memory
-//     （≈显存，只是有 L1 缓存，见 notes）。
-// 分派条件 (N + blockDim.x - 1) / blockDim.x <= kRegTile 只依赖 N 与 blockDim、对整
-// block 一致，故两条分支各自调用含 __syncthreads 的 blockReduceOnline 不会死锁。
+// 真寄存器的关键：循环上界 kRegTile 为编译期常量 + #pragma unroll 整体展开，使下标 k
+// 成为常量、reg[k] 静态寻址（寄存器不可被运行期索引，运行期下标会退化为 local
+// memory，反面对照见 v3_false 声明）。分派条件只依赖 N 与 blockDim、对整 block 一致，
+// 故两条分支各自调用含 __syncthreads 的 blockReduceOnline 不会死锁。
 constexpr int kRegTile = 16;  // 每线程寄存器分片容量（block = 256 时覆盖 N <= 4096）
 
 __global__ void online_softmax_v3(const float* input, float* output, const int M, const int N) {
@@ -264,13 +260,10 @@ __global__ void online_softmax_v3(const float* input, float* output, const int M
 // online_softmax_v3_false —— v3 的「假寄存器」反面对照（运行期下标 → local memory）
 // ---------------------------------------------------------------------------
 // 行映射 / 归约 / 启动约束见 online_softmax.cuh 的 v3_false 声明，与 v3 逐项同构，唯一
-// 区别：缓存本线程列时用运行期下标 `reg_cache[count++]`，而非 v3 的编译期常量下标 `reg[k]`。
-// 寄存器不可被运行期索引，ptxas 只能把整个数组放进 local memory（物理是显存、仅靠 L1
-// 缓存），故第 1 遍的每次写入、写回遍的每次读取都是 local memory 往返。
-// 本版**不做列宽分派、无回退路径** —— 始终缓存，契约要求 ceil(N / blockDim.x) <= kRegTile
-// （block = 256 时 N <= 4096）；超过则 reg_cache 越界写入（未定义行为），由调用方保证。
-// 去掉分支是为了与 v3 形成最干净的对照（无分派开销）；该版本只用于量化「local memory 缓存
-// vs 真寄存器缓存 vs 重读全局」的代价，非性能候选。
+// 区别是缓存本线程列时用运行期下标 `reg_cache[count++]`，而非 v3 的编译期常量下标
+// `reg[k]`。寄存器不可被运行期索引，该定长数组被 ptxas 整体放进 local memory，故第 1
+// 遍的写入与写回遍的读取都是 local memory 往返；本版不做列宽分派、无回退路径（契约见
+// 声明）。
 __global__ void online_softmax_v3_false(const float* input, float* output, const int M,
                                         const int N) {
 	const int row = blockIdx.x;  // 每 block 处理一行

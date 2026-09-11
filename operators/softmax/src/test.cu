@@ -32,9 +32,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
 		return false;
 	}
 
-	// 元素总数。启动网格按被测内核的行映射由调用方给出（见 softmax.cuh）：v0
-	// 线程铺满行号、v1/v2/v3/v4/v5 每行一个 block；空矩阵 rows == 0 时 grid 也须
-	// >= 1，内核由 row >= rows 越界判定空转。
+	// 元素总数。启动网格由调用方按被测内核的行映射给出（见 main.cu 的 RowMap /
+	// GridFor）；空矩阵 rows == 0 时 grid 也须 >= 1，各内核在 rows == 0 时空转。
 	const std::int64_t count = static_cast<std::int64_t>(rows) * cols;
 
 	// 输入取确定性伪随机（行/列相关），范围 [-10, 10)：可复现，且不会让 exp 溢出
@@ -62,10 +61,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
 	}
 
 	// 只有 cudaLaunchKernel 才能以“运行期内核函数指针”启动，从而一份驱动复用所有
-	// 版本；args 中需放与形参 const 修饰严格匹配的指针。grid/block/smem_bytes 按
-	// 被测内核的映射给出（v0 无动态共享内存 smem_bytes = 0；v1 为 blockDim.x 个
-	// float；v2/v3 = 0 —— 仅用内部静态 __shared__ 中转；v4/v5 为 cols 个 float ——
-	// v4 缓存整行 x、v5 缓存整行 exp，随列宽增长）。
+	// 版本；args 中需放与形参 const 修饰严格匹配的指针。grid/block/smem_bytes 由调用
+	// 方按被测内核的行映射给出（见 main.cu 的 RowMap / GridFor / SmemFor）。
 	// host_kernel 非空时走主机 API 通道（如 cuDNN 对照参考，见 test.cuh），它自行
 	// 启动计算，上面的启动配置只作为未使用参数存在。
 	const dim3 grid_dim(grid);
@@ -109,8 +106,8 @@ bool test_softmax_kernel(SoftmaxKernel kernel, const char* kernel_name, int rows
 	const float p95_ms = sorted_ms[(sample_count - 1) * 95 / 100];
 
 	// 有效带宽 =（输入读 rows*cols 个 float + 输出写 rows*cols 个 float）/ 中位耗时
-	// （逻辑数据量，每元素计 1 读 1 写；各版本实际都三遍各读行一次、访问模式
-	// 各异，低效会直接反映为更低的“有效带宽”，见 README）。
+	// （逻辑数据量，每元素计 1 读 1 写；各版本实际读行次数 / 访问模式各异，低效会
+	// 直接反映为更低的“有效带宽”，见 README）。
 	const double bytes_per_run = 2.0 * static_cast<double>(count) * sizeof(float);
 	const double bandwidth_gbps = bytes_per_run / (median_ms * 1e6);
 

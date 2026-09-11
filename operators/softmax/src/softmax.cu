@@ -70,14 +70,9 @@ struct CudnnCtx {
 
 }  // namespace
 
-// softmax_cudnn —— 契约见 softmax.cuh 的声明。实现要点：
-//   * cuDNN 按 NCHW 理解数据、没有「行主序矩阵」这种输入形式，需显式给 stride 映射：
-//     [n=M, c=1, h=1, w=N] + nStride=N —— 第 r 行落在 input + r*N，c/h 退化为单元素。
-//     配 MODE_INSTANCE（对每个 n 在 C·H·W = N 上归一）即逐行 softmax；若误用
-//     MODE_CHANNEL，在 C=1 的映射下每个元素自成一「通道」，归一化退化为恒等。
-//   * ACCURATE 已含 max-shift，与本仓库内核数值稳定性同档；两者累加顺序不同，故只做
-//     量级与性能对照，不作为逐元素精确基准（见 README）。
-//   * x/y 形状相同，共用同一描述符，省一次创建。
+// softmax_cudnn —— 契约与张量映射 / 模式选择见 softmax.cuh 的声明。实现要点：句柄
+// 与描述符进程内复用（避免主机侧创建开销污染事件计时）；x/y 形状相同、共用同一
+// 描述符。
 void softmax_cudnn(const float* input, float* output, int M, int N) {
 	if (M <= 0 || N <= 0) return;  // 空矩阵 / 空行：无元素可算（cuDNN 不接受 0 维张量）
 
@@ -297,9 +292,8 @@ __global__ void softmax_v2(const float* input, float* output, const int M, const
 // ---------------------------------------------------------------------------
 // softmax_v3 —— 每行一个 block，v2 行遍历 + float4 向量化（列宽为 4 的倍数时）
 // ---------------------------------------------------------------------------
-// 行映射 / 归约 / 启动约束同 v2，见 softmax.cuh 的 v3 声明（含“非 4 倍列宽为何
-// 整行回退标量”的说明）。实现要点：N % 4 == 0 时行首 16 B 对齐，主循环每轮取
-// 1 个 float4（4 列，读/写指令数为标量 1/4）；否则走 else 分支的 v2 式标量三遍。
+// 行映射 / 归约 / 启动约束同 v2，见 softmax.cuh 的 v3 声明。实现按列宽二分支：
+// N % 4 == 0 走 float4 主循环（每轮 4 列），否则走 v2 式标量三遍（见函数体）。
 __global__ void softmax_v3(const float* input, float* output, const int M, const int N) {
 	const int row = blockIdx.x;  // 每 block 处理一行
 	if (row >= M) return;        // 空矩阵 / 超配 grid：越界行空转
@@ -362,15 +356,16 @@ __global__ void softmax_v3(const float* input, float* output, const int M, const
 	}
 }
 
+// ---------------------------------------------------------------------------
+// softmax_v4 —— 每行一个 block：动态共享内存按行宽缓存整行 x，全局读 1 遍
+// ---------------------------------------------------------------------------
+// 行映射 / 启动约束同 v2/v3，见 softmax.cuh 的 v4 声明。实现结构：① float4 全局
+// 读求行最大的同时把整行写进 smem4[i] → ② 从 smem 读 x 算 exp、原地覆盖为 exp
+// 值并累加行和 → ③ 从 smem 读 exp 归一化写回。缓存两段生命周期（x → exp）之间各
+// 隔一次 blockReduce —— 其尾部 __syncthreads 保证写者全部就绪后才被下一遍读取
+// （见 helper 注释）。N % 4 == 0 时 ①② 走 float4，否则整行回退标量。
 __global__ void softmax_v4(const float* input, float* output, const int M, const int N) {
-	// 动态共享内存按 float4 槽使用（16 B 对齐），字节数仍为 N * sizeof(float)。
-	// 整行只从全局读 1 遍：① 读 x 的同时把整行缓存进 smem（并求行最大）；② 从
-	// smem 读缓存 x 算 exp、原地覆盖为 exp 值并累加行和；③ 从 smem 读 exp 归一化
-	// 写回 —— 全局流量 = 读 1 遍 + 写 1 遍（理论下限）。整除判断只分派一次：
-	// N % 4 == 0 时 ①② 都走 float4（全局读 + smem 槽 16 B 整写），否则整行标量。
-	// 缓冲区两段生命周期（x → exp）之间各隔一次 blockReduce —— 其尾部 __syncthreads
-	// 保证写者全部就绪后才被下一遍读取，见 helper 注释。
-	extern __shared__ float4 smem4[];
+	extern __shared__ float4 smem4[];  // 动态共享内存：N * sizeof(float)，按 16 B 槽用
 	const int row = blockIdx.x;
 	if (row >= M) return;
 	const int tid = threadIdx.x;
@@ -437,20 +432,12 @@ __global__ void softmax_v4(const float* input, float* output, const int M, const
 }
 
 // ---------------------------------------------------------------------------
-// softmax_v5 —— 每行一个 block：全局读 2 遍 + float4，exp 只算 1 次
+// softmax_v5 —— 每行一个 block：全局读 2 遍 + float4，动态共享内存只装 exp
 // ---------------------------------------------------------------------------
-// v4 前身思路的原样接入：行内不再把 x 缓存进 smem，而是改全局读 2 遍 —— ① 读全局
-// 求行最大（读后即弃）；② 再读全局算 exp、把 exp 值写进动态共享内存（整行）并累加
-// 行和；③ 从 smem 读 exp 乘 inv_sum 归一化写回。三种资源流量对比：
-//   * v3：全局读 3 遍 + exp 算 2 次 + 写 1 遍（②③ 各算一次 exp）；
-//   * v4：全局读 1 遍 + exp 算 1 次 + 写 1 遍，但 x 要 smem 写 1 次 + 读 1 次往返
-//     （x、exp 两轮缓存，smem 流量是 v5 的两倍）；
-//   * v5：全局读 2 遍 + exp 算 1 次 + 写 1 遍，smem 只存 exp（写 1 读 1）—— 以
-//     “多读 1 遍全局”换掉 v4 的 “x 经 smem 往返”，全局读带宽富余时更划算（v4 的
-//     smem 往返被怀疑是主要开销，见 README 结论记录）。
-// 启动约束同 v4，见 softmax.cuh 的 v5 声明。实现要点与 v4 一致：N % 4 == 0 时行首
-// 16 B 对齐，①/②/③ 全走 float4（② 的 4 个 exp 一次算完并 16 B 整写进 smem4[i]，
-// ③ 乘 inv_sum 后 float4 整写回 y —— 读/写指令数均为标量 1/4）；否则整行回退标量。
+// 行映射 / 启动约束同 v4，见 softmax.cuh 的 v5 声明。实现结构：① float4 全局读求
+// 行最大（读后即弃）→ ② 再 float4 全局读算 exp、16 B 整写进 smem4[i] 并累加行和
+// → ③ 从 smem 读 exp 乘 inv_sum 后 float4 整写回 y（缓存内容为 exp，区别于 v4 的
+// x）。N % 4 == 0 时三遍全走 float4，否则整行回退标量（见函数体分支）。
 __global__ void softmax_v5(const float* input, float* output, const int M, const int N) {
 	extern __shared__ float4 smem4[];  // 动态共享内存：N * sizeof(float)，只装 exp 值
 	const int row = blockIdx.x;

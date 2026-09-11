@@ -45,6 +45,12 @@
 
 ### Changed
 
+- 2026-09-11 17:20 `operators/softmax`：按 `AGENTS.md` §6「不缺 / 不冗余 / 不失真」重写全部源码注释
+  - `softmax.cuh` / `.cu`：文件头逐版本演进长段收敛为一行版本索引；删去 v4/v5 的「资源流量对比」与推导叙述（归口 README），实现侧（v3/v4/v5、cuDNN）注释收敛为「结构要点 + 指向 `.cuh` / README」；声明侧保留作用 / 参数 / 返回值 / 启动约束（grid、blockDim、smem 字节数）/ 注意事项
+  - `online_softmax.cuh` / `.cu`：同口径收敛，v3 / v3_false 的「真寄存器 / local memory」推导压缩去重、归口 README，保留启动约束与正反对照关系
+  - `test.cuh` / `test.cu`：`grid` / `smem_bytes` 参数说明由「逐版本罗列」改为「由调用方按行映射给出（见 `main.cu` 的 `RowMap` / `GridFor` / `SmemFor`）」，避免版本增删后失真；并修正有效带宽注释中「各版本实际都三遍各读行一次」的错误表述（v0~v3 读 3 遍、v4 读 1 遍、v5 与 online 各版读 2 遍）
+  - `main.cu`：`kBlock` / `RowMap` / 边界场景 / `GridFor` / `SmemFor` 注释去版本化收敛，版本口径统一指向 `.cuh` 与 README
+  - 验证：`cmake --build build --target softmax` 编译通过、默认档 24/24 PASS；`git diff` 核对为纯注释改动（无代码语义变化）
 - 2026-09-10 11:10 全仓库严格基准采样口径下调（面向 RTX 4060 Laptop）
   - `docs/benchmark-methodology.md` §3.2/§3.4：严格档由 1000 预热 + 21 组 × 10000 次下调为 100 预热 + 21 组 × 1000 次（总 2.1 万次调用，约 1/10），并说明下调原因（慢内核整表严格基准耗时过长）
   - `AGENTS.md` §5：默认迭代建议同步为严格对比 100 预热 + 21 组 × 1000 次

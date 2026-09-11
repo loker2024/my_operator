@@ -26,29 +26,19 @@
 
 namespace {
 
-// 每 block 线程数（默认 256）：v0/online-v0 用它铺满行号，v1/v2/v3/v4/v5/online-v1/
-// online-v2/online-v3/online-v3_false/online-v4 用作每行的协作线程数。256 同时满足 v1 的"2 的幂"（折半归约）与 v2/v3/
-// v4/v5/online-v1/online-v2/online-v3/online-v3_false/online-v4 的"32 的倍数"（warp shuffle）约束，见 softmax.cuh /
-// online_softmax.cuh 各版本的启动约束。
+// 每 block 线程数（默认 256）：kThreadPerRow 用它铺满行号，其余行映射用作每行协作
+// 线程数。256 同时满足各版本的“2 的幂 / 32 的倍数”约束（见 softmax.cuh /
+// online_softmax.cuh 各版本启动约束）。
 constexpr int kBlock = 256;
 
-// 行映射与启动配置 —— 决定每个场景的启动 grid 与动态共享内存，见 softmax.cuh
-// 各版本的启动约束。
+// 行映射 —— 决定每个被测内核的启动 grid 与动态共享内存（见 GridFor / SmemFor；各内核
+// 的行映射以 softmax.cuh / online_softmax.cuh 的启动约束为准）。
 enum class RowMap {
-	kThreadPerRow,  // v0/online-v0：每线程处理一行，grid = ceil(rows / block)，无共享内存
-	kBlockPerRow,         // v1：每行一个 block，grid = rows，smem = block * sizeof(float)
-	kBlockPerRowShuffle,  // v2/v3/online-v1/online-v2/online-v3/online-v3_false：每行一个 block +
-	                      //     两级 warp shuffle 归约，grid = rows，无动态共享内存（内部仅静态
-	                      //     __shared__ 中转）。v3 与 online-v2 的 float4 向量化只
-	                      //     影响行内访问，启动配置同 v2；online-v1 的在线归约同理
-	                      //     （见 online_softmax.cuh v1/v2）
-	kBlockPerRowRowCache,  // v4/v5：每行一个 block + 动态共享内存缓存整行（v4 缓存
-	                       //     x、v5 缓存 exp），grid = rows，smem = cols * sizeof
-	                       //     (float)（随行宽，启动约束见 softmax.cuh v4/v5）
-	kGridStrideRow,        // online-v4：每 block 经 grid-stride 循环处理多行，
-	                       //     grid = min(rows, SM 数 × kGridStrideBlocksPerSm)，
-	                       //     无动态共享内存（内部仅静态 __shared__ 中转，见
-	                       //     online_softmax.cuh v4）
+	kThreadPerRow,         // 每线程处理一行：grid = ceil(rows / block)，无共享内存
+	kBlockPerRow,          // 每行一个 block + smem 折半树形归约：grid = rows
+	kBlockPerRowShuffle,   // 每行一个 block + 两级 warp shuffle 归约：grid = rows
+	kBlockPerRowRowCache,  // 每行一个 block + smem 缓存整行：grid = rows
+	kGridStrideRow,        // 每 block grid-stride 处理多行：grid = min(rows, 上限)
 };
 
 // online-v4（kGridStrideRow）启动 block 数上限系数：grid = min(rows, SM 数 × 本值)。
@@ -106,20 +96,14 @@ const Scenario kNormalScenarios[] = {
     {"正常: 16384x1024 (宽行场景)", 16384, 1024},
 };
 
-// 场景组 B：边界条件 —— 行数在 v0 的"block 线程铺满行号"覆盖边界附近（差 1 /
-// 恰满载 / 超 1 / 末 block 仅余 1 行），列宽在 v1/v2/v3/v4/v5 与 online-v1/online-v2/
-// online-v4 的"行内协作"边界附近（online-v1 的覆盖路径同 v2/v3：stride 扫行 + 块内
-// shuffle 合并，无向量化分派；online-v2 与 online-v4 的覆盖路径同 v3：另按列宽分派
-// float4；差 1 / 恰满载 / 超 1 / 第 2 轮仅余 1 列，以及 warp 边界附近的 31/32/33 ——
-// v2/v3/v4/v5 与 online-v1/online-v2/online-v4 warp shuffle 归约的关键路径：仅前几个
-// warp 持有数据、其余 warp 以归约单位元参与）；两种维度分别覆盖各版本的越界空转、
-// 空转线程与多轮 stride 等路径。行数边界组行数 ≤ 2*block < grid-stride 上限（768），
-// 对 online-v4 走「grid = rows、一行一 block」的退化路径；grid-stride「同一 block
-// 处理多行」路径由正常流程组（rows 4096 / 16384 > 768）覆盖。
-// 非 4 倍列宽场景对 v3/v4/v5 与 online-v2/online-v4 走标量回退；末尾另补 4 个 float4
-// 对齐边界（列宽为 4 的倍数、向量主循环在 block 线程数附近）专测 v3/v4/v5 与
-// online-v2/online-v4 的向量化路径，对 v0/v1/v2 与 online-v1 只是多一轮 stride 冗余
-// 覆盖（无副作用）。
+// 场景组 B：边界条件 —— 覆盖各版本的关键路径：行数边界（block-1 / block / block+1 /
+// 2*block-1）对应 kThreadPerRow 的越界空转与末 block 仅余 1 行；行宽边界（block±1 /
+// 2*block-1，以及 warp 边界 31/32/33）对应 kBlockPerRow* 的多轮 stride、空转线程与
+// warp shuffle 归约（仅前几个 warp 持有数据、其余以归约单位元参与）；float4 边界（4 的
+// 倍数、向量主循环在 block 线程数附近）对应 kBlockPerRowShuffle / kBlockPerRowRowCache 的
+// 向量化路径，非 4 倍列宽场景覆盖标量回退。kGridStrideRow 的「同一 block 处理多行」由
+// 正常流程组（rows 4096 / 16384 远大于上限）覆盖，本组行数 ≤ 2*block 时退化为「一行一
+// block」。各版本的完整覆盖矩阵见 README。
 const Scenario kBoundaryScenarios[] = {
     {"边界: 1x1, 最小非空", 1, 1},
     // 行数边界（v0 关键路径）
@@ -151,11 +135,8 @@ const Scenario kAbnormalScenarios[] = {
     {"异常: 3x0, 每行 0 列(空行)", 3, 0},
 };
 
-// 按行映射方式求“覆盖全部行”的最小 grid；rows == 0 时也须 >= 1（内核以
-// row >= rows 越界空转，见 softmax.cuh / online_softmax.cuh）。kBlockPerRow /
-// kBlockPerRowShuffle（含 online-v1/online-v2/online-v3/online-v3_false）/ kBlockPerRowRowCache 都是每行一个
-// block → grid = rows；kGridStrideRow（online-v4）用 grid-stride 循环处理多行 →
-// grid = min(rows, SM 数 × kGridStrideBlocksPerSm)。
+// 按行映射求“覆盖全部行”的最小 grid；rows == 0 时也须 >= 1（内核在 rows == 0 时空转，
+// 见 softmax.cuh / online_softmax.cuh）。
 int GridFor(int rows, RowMap row_map) {
 	if (rows == 0) return 1;
 	switch (row_map) {
@@ -171,21 +152,21 @@ int GridFor(int rows, RowMap row_map) {
 	return 1;  // 不可达
 }
 
-// 按行映射方式求每 block 的动态共享内存（字节数，见 softmax.cuh / online_softmax.cuh）；
-// 除 v4/v5（kBlockPerRowRowCache 缓存整行、随列宽 cols 增长）外均与行宽无关。
+// 按行映射求每 block 的动态共享内存字节数（见 softmax.cuh / online_softmax.cuh）：仅
+// kBlockPerRow（block 个归约中间量）与 kBlockPerRowRowCache（整行缓存、随列宽增长）非
+// 零，其余内核不依赖动态共享内存。
 std::size_t SmemFor(RowMap row_map, int cols) {
 	switch (row_map) {
 		case RowMap::kThreadPerRow:
-			return 0;  // v0/online-v0 无共享内存
+			return 0;  // 无共享内存
 		case RowMap::kBlockPerRow:
-			return static_cast<std::size_t>(kBlock) * sizeof(float);  // v1 动态共享内存
+			return static_cast<std::size_t>(kBlock) * sizeof(float);  // 归约中间量：block 个 float
 		case RowMap::kBlockPerRowShuffle:
-			return 0;  // v2/v3/online-v1/online-v2/online-v3/online-v3_false 仅用内部静态
-			           // __shared__ 中转，无需动态共享内存
+			return 0;  // 仅内部静态 __shared__ 中转
 		case RowMap::kBlockPerRowRowCache:
-			return static_cast<std::size_t>(cols) * sizeof(float);  // v4/v5 整行缓存，随行宽
+			return static_cast<std::size_t>(cols) * sizeof(float);  // 整行缓存，随列宽
 		case RowMap::kGridStrideRow:
-			return 0;  // online-v4 仅用内部静态 __shared__ 中转，无需动态共享内存
+			return 0;  // 仅内部静态 __shared__ 中转
 	}
 	return 0;  // 不可达
 }

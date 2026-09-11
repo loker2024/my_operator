@@ -2,22 +2,12 @@
 // ============================================================================
 // online_softmax.cuh —— online softmax 接口声明（行主序 fp32 矩阵，逐行归一化）
 //   独立实现单元：实现见 online_softmax.cu，测试驱动见 test.cuh/test.cu，注册与
-//   场景见 main.cu；推导与实测见 operators/softmax/README.md。
+//   场景见 main.cu；公式推导与实测见 operators/softmax/README.md。
 //
-//   与 softmax.cuh（v0~v5）的差异：v0~v5 是「先求行最大 m、再求 Σexp」的两趟归约，
-//   本单元改单趟 online 归约 —— 用二元组 (m, d) 在同一趟遍历里增量维护行最大与
-//   分母：m' = max(m, x)、d' = d * exp(m - m') + exp(x - m')（d 先按新旧基准之差
-//   缩放回新基准，再加新元素贡献），把求 m 与求 Σexp 合并为一趟全局读。
-//
-//   单元内各版本的差别只在行内 / 块内的协作方式与访存宽度：v0 每线程独占一行
-//   （无协作），v1 每行一个 block、块内两级 warp shuffle 合并各线程的 (m, d)
-//   （读合并，是后续「分块 + 在线合并」的 FlashAttention 形态的雏形），v2 在 v1
-//   基础上按列宽分派 float4 向量化（仅影响行内访问宽度，归约与启动约束同 v1），
-//   v3 用编译期定长 + 静态下标的寄存器分片缓存省掉第 2 遍全局读，v3_false 是 v3
-//   的反面对照 —— 同样想缓存行，但用运行期下标写入定长数组，被 ptxas 降级为
-//   local memory（“假寄存器”）；v4 把「每行一个 block」换成「每 block 经
-//   grid-stride 循环处理多行」（块复用），行内归约 / 向量化同 v2，用于量化
-//   「减少启动 block 数、复用寄存器与静态共享内存」相对「一行一 block」的代价。
+// 与 softmax.cuh（v0~v5）的差异：v0~v5 是「先求行最大 m、再求 Σexp」的两趟归约；
+//   本单元改单趟在线归约 —— 以二元组 (m, d) 在同一趟遍历里增量维护行最大与分母
+//   （m' = max(m, x)、d' = d * exp(m - m') + exp(x - m')），把求 m 与求 Σexp 合并
+//   为一趟全局读。各版本差别只在行内 / 块内协作方式与访存宽度，见各版本声明。
 // ============================================================================
 
 #include <cuda_runtime.h>  // __global__、cudaError_t 等 CUDA 基本定义
@@ -33,9 +23,8 @@ __global__ void online_softmax_v0(const float* input, float* output, const int M
 // online_softmax_v1 每行一个 block，行内在线归约 + 块内两级 warp shuffle 合并：
 //   * row = blockIdx.x，grid = M（M == 0 时也须 >= 1，由 row >= M 越界空转）；
 //   * 每线程以 stride = blockDim.x 单趟在线归约自己的列子集得局部 (m, d)，再由
-//     两级 warp shuffle 合并出整行 (m, d) —— 每 warp 先 shfl 归约为 1 个二元组，
-//     warp 0 再合并 num_warps 个 warp 值并广播回全体（归约语义同 softmax.cuh
-//     v2）；warp 内同轮访问相邻列 → 全局读合并；
+//     两级 warp shuffle 合并出整行 (m, d)（归约语义同 softmax.cuh v2）；
+//     warp 内同轮访问相邻列 → 全局读合并；
 //   * blockDim.x 须为 32 的倍数且 <= 1024（默认 256）：shuffle 需整 warp 收敛，
 //     且各 warp 的二元组要装进中转用的 warp_m[32] / warp_d[32]；中转用静态
 //     __shared__，无动态共享内存（smem_bytes = 0）；
@@ -50,8 +39,7 @@ __global__ void online_softmax_v1(const float* input, float* output, const int M
 //     主循环每轮 stride 取 1 个 float4（4 列，逐分量 mergeOnline / 算 exp 后整写
 //     回）—— 读/写指令数为标量的 1/4，无标量尾部；
 //   * 否则：整行回退 v1 式标量两遍 —— 非 4 倍列宽时第 row>=1 行的行首 16 B 不
-//     对齐，float4 重解释是未定义行为，尾列处理救不了跨行对齐（正确性不受影响，
-//     仅无向量化收益）；
+//     对齐，float4 重解释是未定义行为（正确性不受影响，仅无向量化收益）；
 //   * 启动约束同 v1：row = blockIdx.x、grid = M（M == 0 时也须 >= 1，由 row >= M
 //     越界空转）、blockDim.x 为 32 的倍数且 <= 1024；smem_bytes = 0；N == 0 的空行
 //     不读不写。
@@ -61,45 +49,39 @@ __global__ void online_softmax_v2(const float* input, float* output, const int M
 //   两级 warp shuffle 合并；row = blockIdx.x、grid = M（M == 0 时也须 >= 1，由
 //   row >= M 越界空转）、blockDim.x 为 32 的倍数且 <= 1024、无动态共享内存、
 //   N == 0 的空行不读不写），仅把写回遍的 x 来源从「重读全局」改为「寄存器分片缓存」：
-//   * 每线程元素数 ceil(N / blockDim.x) <= REG_TILE（常数，当前 16，见
-//     online_softmax.cu 的 kRegTile）时走寄存器路径 —— 第 1 遍在线归约的同时把本线程
-//     负责的列缓存进**编译期定长、静态下标**的寄存器数组（#pragma unroll 整体展开，
-//     reg[k] 静态寻址故留在寄存器、不会降级为 local memory），写回遍直接取寄存器，
-//     省掉第 2 遍全局读；
+//   * 每线程元素数 ceil(N / blockDim.x) <= kRegTile（见 online_softmax.cu，当前 16）
+//     时走寄存器路径 —— 第 1 遍在线归约的同时把本线程负责的列缓存进**编译期定长、
+//     静态下标**的寄存器数组（#pragma unroll 整体展开，reg[k] 静态寻址故留在寄存器、
+//     不会降级为 local memory），写回遍直接取寄存器、省掉第 2 遍全局读；
 //   * 否则（列宽过大、寄存器分片装不下）自动回退 v1/v2 式两遍重读 —— 与 v0~v2 一样
 //     对任意列宽均正确。分派条件只依赖 N 与 blockDim、对整 block 一致，两条分支内的
 //     __syncthreads 均安全。
 __global__ void online_softmax_v3(const float* input, float* output, const int M, const int N);
 
-// online_softmax_v3_false 行遍历 / 归约 / 启动约束均同 v3，唯一区别在「寄存器分片」的写法
-//   —— 本版刻意用**运行期下标**缓存本线程列（`reg_cache[count++]`）。寄存器不可被运行期
-//   索引，ptxas 会把该定长数组整体降级为 **local memory**（物理是显存、仅靠 L1 缓存），
-//   数组名字叫 reg 但并未落在寄存器 —— 即「假寄存器」。
-//   * **不做列宽分派、无回退路径**，始终缓存：要求 ceil(N / blockDim.x) <= kRegTile（16，
-//     见 online_softmax.cu；block = 256 时 N <= 4096）。超过则该定长数组越界写入（未定义
-//     行为），由调用方保证 —— 去掉分派是为了与 v3 形成最干净的对照。
-//   * 第 1 遍在线归约的同时把本线程负责的列以运行期下标写入定长数组，写回遍按同一顺序
-//     取回，省掉第 2 遍全局读，但每次存取走 local memory。
-//   本版是 v3 的反面对照：与 v3 逐项同构，只差下标是否静态，用于量化「local memory 缓存」
-//   相对「真寄存器缓存」/「重读全局」的代价，实测见 README.md。
+// online_softmax_v3_false 行遍历 / 归约 / 启动约束均同 v3，唯一区别在缓存本线程列的
+//   下标 —— 本版刻意用**运行期下标**（`reg_cache[count++]`）。寄存器不可被运行期索引，
+//   ptxas 会把该定长数组整体降级为 **local memory**（物理是显存、仅靠 L1 缓存），数组
+//   名字叫 reg 但并未落在寄存器 —— 即「假寄存器」。
+//   * 第 1 遍在线归约的同时缓存本线程列，写回遍按同一顺序取回，同样省掉第 2 遍全局读；
+//   * **不做列宽分派、无回退路径**：始终缓存，要求 ceil(N / blockDim.x) <= kRegTile
+//     （见 online_softmax.cu；block = 256 时 N <= 4096），超过则该定长数组越界写入
+//     （未定义行为），由调用方保证 —— 去掉分派是为了与 v3 形成最干净的对照；
+//   * 本版是 v3 的反面对照，用于量化「local memory 缓存」相对「真寄存器缓存」/
+//     「重读全局」的代价，非性能候选；实测见 README.md。
 __global__ void online_softmax_v3_false(const float* input, float* output, const int M, const int N);
 
 // online_softmax_v4 grid-stride 多行处理（块复用）+ 全优化集成：行内归约与访存同
 //   online-v2（单趟在线归约 + 两级 warp shuffle 合并、按列宽分派 float4），唯一区别
 //   在行映射 —— 每个 block 经 grid-stride 循环处理**多行**，复用同一份寄存器与静态
 //   __shared__ 连续工作：
-//   * row = blockIdx.x; row < M; row += gridDim.x —— 启动 block 数由调用方给出
-//     （测试中取 min(rows, SM 数 × kGridStrideBlocksPerSm)，见 main.cu）：rows 远大于
-//     该上限时不再启动 rows 个 block，而是让每个 block 顺序处理多行，省掉多余 block
-//     的调度 / 建立开销；
+//   * row = blockIdx.x; row < M; row += gridDim.x —— 启动 block 数由调用方给出（测试
+//     中取 min(rows, SM 数 × kGridStrideBlocksPerSm)，见 main.cu）；
 //   * 行内：① 单趟在线归约本线程列子集（N % 4 == 0 时 float4 主循环、否则标量），
-//     两级 warp shuffle 合并出整行 (m, d)；② 第二趟读行重算 exp(x - m) / d 写回
-//     （全局读 2 遍 + 写 1 遍，exp 每元素 2 次）；
-//   * 启动约束：blockDim.x 为 32 的倍数且 <= 1024（同 online-v1/v2，shuffle 需整 warp
-//     收敛）；无动态共享内存（smem_bytes = 0，内部仅静态 __shared__ 中转）；
+//     两级 warp shuffle 合并出整行 (m, d)；② 第二趟读行重算 exp(x - m) / d 写回；
+//   * 启动约束：blockDim.x 为 32 的倍数且 <= 1024（同 online-v1/v2）；无动态共享内存
+//     （smem_bytes = 0，内部仅静态 __shared__ 中转）；
 //   * 跨行复用共享内存是安全的：同一 block 内所有线程的行循环 trip count 一致，
 //     blockReduceOnline 的收尾 __syncthreads 已把「上一行读完中转值」排在「下一行
 //     写入中转值」之前，无需在循环末尾额外同步；
-//   * M == 0 时循环 0 次、N == 0 的空行不读不写；列宽非 4 的倍数时整行回退标量
-//     （跨行行首 16 B 不对齐，float4 重解释是未定义行为）。
+//   * M == 0 时循环 0 次、N == 0 的空行不读不写；列宽非 4 的倍数时整行回退标量。
 __global__ void online_softmax_v4(const float* input, float* output, const int M, const int N);
