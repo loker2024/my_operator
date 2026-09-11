@@ -4,6 +4,27 @@ cmake_minimum_required(VERSION 3.24)
 # 这样在没有 GPU/CUDA 的环境下也能完成文档级配置。
 project(my_operator LANGUAGES CXX)
 
+# toolkit 根目录兜底：若 PATH 里的 nvcc 是软链（如 /usr/local/bin/nvcc ->
+# /usr/local/cuda-12.8/bin/nvcc），CMake 会按软链所在目录把根误判为 /usr/local，
+# 进而找不到 include/cuda_runtime.h。这里先把 nvcc 解析到真实路径，仅当其上级目录
+# 确实是 CUDA 安装根（含 include/cuda_runtime.h）时才作为提示；解析不到就保持原行为。
+if(NOT CUDAToolkit_ROOT)
+  find_program(MY_OPERATOR_NVCC_IN_PATH NAMES nvcc)
+  if(MY_OPERATOR_NVCC_IN_PATH)
+    get_filename_component(_nvcc_real "${MY_OPERATOR_NVCC_IN_PATH}" REALPATH)
+    get_filename_component(_cuda_root "${_nvcc_real}" DIRECTORY)
+    get_filename_component(_cuda_root "${_cuda_root}" DIRECTORY)
+    if(EXISTS "${_cuda_root}/include/cuda_runtime.h")
+      set(CUDAToolkit_ROOT "${_cuda_root}")
+      # 编译器也指向真实路径：否则 enable_language(CUDA) 会再次按软链所在目录
+      # 推导库根，报 "Couldn't find CUDA library root"。用户显式指定时以用户为准。
+      if(NOT CMAKE_CUDA_COMPILER)
+        set(CMAKE_CUDA_COMPILER "${_nvcc_real}" CACHE FILEPATH "CUDA compiler")
+      endif()
+    endif()
+  endif()
+endif()
+
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
   message(STATUS "CUDA Toolkit: ${CUDAToolkit_VERSION} (${CUDAToolkit_BIN_DIR})")
