@@ -5,14 +5,18 @@
 //   正确性 + 性能测试；内核注册、场景编排与各版本的启动配置见 main.cu。
 //   口径：正确性相对误差 <= 1e-5（逐元素，跳过 |ref| 过小的元素）；性能采样分
 //   “开发 / 严格”两档（见 docs/benchmark-methodology.md，与 reduce 测试一致）。
+//   每份英文报告均先打印缓存的 GPU 静态配置和本次启动配置，再打印正确性结论、CPU /
+//   GPU 耗时、加速比、有效带宽、峰值显存带宽与利用率，以及最大相对误差、采样口径等
+//   明细（渲染见 test.cu 的 PrintReport）。空形状不计时，性能字段显示 N/A。
 // ============================================================================
 
 #include <cstddef>  // std::size_t
 
-#include "softmax.cuh"  // SoftmaxKernel 统一签名及被测算子接口
+#include "softmax_reference.cuh"  // SoftmaxKernel 统一签名及 CPU 参考接口
 
-// 对单个内核跑单场景：生成输入并算 CPU 参考 → 分配/拷入 → 预热 → 计时采样 →
-// 拷回比对逐元素（相对误差 + NaN/Inf）→ 输出报告。
+// 对单个内核跑单场景：生成输入并算 CPU 参考（CpuTimer 计时）→ 分配/拷入 → 预热 →
+// 计时采样（GpuTimer）→ 拷回比对逐元素（相对误差 + NaN/Inf）→ 输出英文报告；每份
+// 报告在结果字段之前打印缓存的 GPU 静态配置和本次启动配置。
 //
 // 参数：
 //   kernel / kernel_name  被测 softmax 内核及其打印名
@@ -25,7 +29,7 @@
 //                         缓存的内核为 cols * sizeof(float)
 //   strict_benchmark      严格采样开关：false（默认）1 次预热 + 100 次迭代；
 //                         true 时 100 次预热 + 21 组 × 1000 次并输出 P5/P95
-//   host_kernel           可选的主机 API 驱动（如 cuDNN 对照参考，见 softmax.cuh 的
+//   host_kernel           可选的主机 API 驱动（如 cuDNN 对照参考，见 softmax_cudnn.cuh 的
 //                         SoftmaxHostKernel）。非 nullptr 时改由它在主机侧自行启动
 //                         计算，此时 kernel / grid / block / smem_bytes 全部忽略
 //                         （rows/cols 的合法性检查仍生效），正确性判据与计时口径与

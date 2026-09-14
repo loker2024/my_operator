@@ -19,7 +19,7 @@ target_link_libraries(softmax PRIVATE operator_common)
 # ---- cuDNN 对照参考（-DSOFTMAX_WITH_CUDNN，默认开启）--------------------------
 # cuDNN 不随 CUDA Toolkit 安装，需单独获取（apt / tar 包 / pip 的 nvidia-cudnn-cu12）。
 # 开启后 src/main.cu 会把厂商库 cudnnSoftmaxForward 当作参考实现跑同一套场景与判据
-# （实现见 src/softmax.cu 的 softmax_cudnn）。本机已装 cuDNN 故默认开启；未装时用
+# （实现见 src/softmax_cudnn.cu 的 softmax_cudnn）。本机已装 cuDNN 故默认开启；未装时用
 # -DSOFTMAX_WITH_CUDNN=OFF 关闭，否则下面的探测会直接报错。
 # 注意 option() 的默认值只在首次 configure 时写进缓存：缓存里已是 OFF 时改这里无效，
 # 须显式传 -DSOFTMAX_WITH_CUDNN=ON 重新 configure。

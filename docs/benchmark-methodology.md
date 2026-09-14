@@ -51,6 +51,12 @@ max_err ≤ tol 且 无 NaN / Inf  →  通过
 - 归约 / Softmax：报告**有效带宽** =（输入读取字节 + 输出写回字节）/ 时间。这是"有效"带宽，不代表显存物理带宽，仅用于同算子内不同版本横向对比。
 - GEMM：报告 `TFLOPS = 2·M·N·K / 时间`。
 - Attention：报告有效带宽（Q/K/V 读 + O 写）为主，同时记录 `ms`。
+- 报告中的**峰值显存带宽**按 `显存时钟(kHz) × 2(双沿) × 位宽/8` 估算，与
+  `common/include/operator_common/cuda_check.h` 的 `PrintDeviceInfo` 同口径 —— 是理论值，
+  不代表实测可达带宽；**带宽利用率** = 有效带宽 / 峰值显存带宽，仅作量级参考，
+  不作为跨算子对比指标。
+- 主机参考实现的单次耗时（`common/include/operator_common/CpuTimer.h`）可随报告一并
+  打印，仅作同机同构建的量级参考，不参与正确性判据，也不作为算子性能指标。
 
 ### 3.4 结果记录模板
 

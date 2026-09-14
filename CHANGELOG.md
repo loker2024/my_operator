@@ -45,6 +45,28 @@
 
 ### Changed
 
+- 2026-09-14 `operators/softmax`：每个测试报告前打印 GPU 指标并统一报告结构
+  - `src/test.cu`：新增进程内缓存的 CUDA Runtime 设备快照；每次 `test_softmax_kernel`
+    调用固定输出 `Test Case`、`GPU Configuration`、`Launch Configuration`、`Results`、
+    `Validation` 五段。GPU 配置含设备名、计算能力、SM 数、显存、每 block 共享内存、显存
+    时钟、总线位宽和按 `显存时钟 × 2 × 位宽/8` 计算的理论峰值带宽；不引入 NVML，不伪造
+    温度、功耗或实时频率。
+  - `Results` 统一保留并首字母大写截图七项英文字段：`CPU & GPU Results Match`、`CPU Time`、
+    `GPU Time`、`Speedup`、`Effective Bandwidth`、`Peak DRAM Bandwidth`、`Bandwidth Utilization`。
+    空形状和非法参数仍生成完整报告，不能测量的性能字段显示 `N/A`。
+  - `src/main.cu`：删除只在程序开头出现的 `PrintDeviceInfo()`，避免无归属且与每报告设备段
+    重复的输出；内核注册、行映射、采样与正确性判据不变。
+  - 验证：在独立 WSL Release 构建目录 `build-softmax-report-cuda/`（CUDA 12.9.86、sm_89、
+    `SOFTMAX_WITH_CUDNN=OFF`）中重新构建通过；默认 12 内核 × 2 正常场景为 24/24 PASS，
+    输出契约检查得到 24 个 `Test Case` 与 24 个 `GPU Configuration`，且截图七项字段均存在；
+    `compute-sanitizer --tool memcheck` 退出码 0、`ERROR SUMMARY: 0 errors`。
+- 2026-09-14 10:00 `operators/softmax`：重构测试驱动，报告与全部输出文案改为英文
+  - `src/test.cu`：`test_softmax_kernel` 由单段长流程收敛为「生成输入与主机参考 → 申请 / 拷入 → 构造启动器 → 预热与计时采样 → 拷回比对 → 渲染报告」的串联结构，各步拆到匿名命名空间的小工具（`PeakDramBandwidthGbps` / `FillDeterministicInput` / `MeasureKernel` / `CompareCellwise` / `PrintMismatchDetail` / `PrintReport`），并引入 `TimingStats` / `CompareStats` / `RunReport` 三个结果结构承载数据；判据（容差 1e-5、跳过 `|ref| < 1e-30`）、采样口径（开发 / 严格两档）与返回值语义均不变
+  - 报告改为英文文案，前 7 行与 `common/include/operator_common/cuda_check.h` 的 `PrintDeviceInfo` 同口径：`CPU & GPU Results match` / `CPU time`（主机参考单次耗时，`CpuTimer`）/ `GPU time`（中位数）/ `Speedup` / `Effective Bandwidth` / `Peak DRAM Bandwidth`（`显存时钟 × 2 × 位宽/8`，查询失败显示 `n/a`）/ `Bandwidth Utilization`；其后为 `max rel err`、采样口径、`out[0][0]` 抽样（改为 `%.6e`）与严格档 `P5 / P95`，失败时打印 `mismatched elements` 与最大误差位置附近元素
+  - `src/test.cuh`：接口注释同步「英文报告」与新增指标说明
+  - `src/main.cu`：被测内核名、场景名、分组标题、跳过提示、汇总行与 cuDNN 参考段文案全部改为英文（`[A] normal` / `[B] boundary` / `[C] abnormal & robustness` / `==== Result: %d/%d items PASS ====`）；`kKernels` 注册项、`RowMap` 与启动配置不变
+  - 验证：`cmake --build build --target softmax` 通过；默认档 24/24 PASS；`enable_boundary=true` 全量回归 240/240 PASS；另以 `-DSOFTMAX_WITH_CUDNN=ON` 在单独构建目录编译并跑通 260/260 PASS（临时目录已清理）；3 个改动文件 `clang-format --dry-run --Werror` 通过
+  - 文档同步：`operators/softmax/README.md`（补报告字段与英文文案说明）、`docs/benchmark-methodology.md` §3.3（补 CPU 参考耗时、峰值显存带宽与利用率的口径及定位）
 - 2026-09-11 17:20 `operators/softmax`：按 `AGENTS.md` §6「不缺 / 不冗余 / 不失真」重写全部源码注释
   - `softmax.cuh` / `.cu`：文件头逐版本演进长段收敛为一行版本索引；删去 v4/v5 的「资源流量对比」与推导叙述（归口 README），实现侧（v3/v4/v5、cuDNN）注释收敛为「结构要点 + 指向 `.cuh` / README」；声明侧保留作用 / 参数 / 返回值 / 启动约束（grid、blockDim、smem 字节数）/ 注意事项
   - `online_softmax.cuh` / `.cu`：同口径收敛，v3 / v3_false 的「真寄存器 / local memory」推导压缩去重、归口 README，保留启动约束与正反对照关系

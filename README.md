@@ -37,7 +37,7 @@ my_operator/
 │   ├── softmax/                # Softmax：CUDA → Triton（src/ 已创建，v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4 完成）
 │   │   ├── README.md           # 规划 + 状态 + 结论记录
 │   │   ├── CMakeLists.txt      # 出现 src/main.cu 后自动启用（各算子同一约定）
-│   │   └── src/                # CUDA 实现：softmax.cuh/.cu、online_softmax.cuh/.cu、test.cuh/.cu、main.cu
+│   │   └── src/                # CUDA 实现：各版本独立 .cuh/.cu、公共归约、参考、测试与入口
 │   ├── gemm/                   # SGEMM：CUDA → Triton（骨架，结构同 softmax）
 │   ├── attention/              # Attention：CUDA → Triton（骨架，结构同 softmax）
 │   └── reduce/                 # Reduce：CUDA 核心版 v0…v7 已实现
