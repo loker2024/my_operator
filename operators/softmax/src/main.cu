@@ -24,7 +24,6 @@
 #include "include/online_softmax_v3.cuh"
 #include "include/online_softmax_v3_false.cuh"
 #include "include/online_softmax_v4.cuh"
-#include "operator_common/cuda_check.h"
 #include "include/softmax_cudnn.cuh"
 #include "include/softmax_reference.cuh"
 #include "include/softmax_v0.cuh"
@@ -34,6 +33,7 @@
 #include "include/softmax_v4.cuh"
 #include "include/softmax_v5.cuh"
 #include "include/test.cuh"
+#include "operator_common/cuda_check.h"
 
 namespace {
 
@@ -207,10 +207,12 @@ int main() {
 	std::printf("---------------- cuDNN cudnnSoftmaxForward (ACCURATE) ----------------\n");
 	for (size_t i = 0; i < CountOf(kNormalScenarios); ++i) {
 		char full_name[192];
-		std::snprintf(full_name, sizeof(full_name), "%s | %s", kCudnnName, kNormalScenarios[i].label);
+		std::snprintf(full_name, sizeof(full_name), "%s | %s", kCudnnName,
+		              kNormalScenarios[i].label);
 		// grid / block / smem 对主机 API 无意义，填合法值即可（见 test.cuh）。
-		const bool ok = test_softmax_kernel(nullptr, full_name, kNormalScenarios[i].rows,
-		                                    kNormalScenarios[i].cols, 1, kBlock, 0, false, softmax_cudnn);
+		const bool ok =
+		    test_softmax_kernel(nullptr, full_name, kNormalScenarios[i].rows,
+		                        kNormalScenarios[i].cols, 1, kBlock, 0, false, softmax_cudnn);
 		all_ok = ok && all_ok;
 		passed += ok ? 1 : 0;
 		total += 1;

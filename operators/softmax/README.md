@@ -242,9 +242,8 @@ online-v1）；online-v4 每 block 经 grid-stride 循环处理多行 →
 - `Validation` 显示最大相对误差、采样口径（严格档另打印 `P5 / P95`）与输出样本；失败时
   显示不匹配元素和最大误差附近元素。空形状或非法参数没有可测工作量，性能字段显示 `N/A`。
 
-被测内核名、场景名、分组标题（`[A] normal` / `[B] boundary` / `[C] abnormal &
-robustness`）、跳过提示与末尾汇总行（`==== Result: N/M items PASS ====`）同样为英文；
-源码注释仍为中文（见 `AGENTS.md` §6）。
+被测内核名、场景名与末尾汇总行（`==== Result: N/M items PASS ====`）均为英文；源码
+注释仍为中文（见 `AGENTS.md` §6）。
 
 构建与运行（仓库根目录）：
 
@@ -266,11 +265,10 @@ cmake --preset release -DSOFTMAX_WITH_CUDNN=OFF    # 未装 cuDNN 时关闭（�
 
 开启后 `main.cu` 会在被测内核之后追加一段 cuDNN 参考（`cudnnSoftmaxForward`，
 `ACCURATE` + `MODE_INSTANCE`，实现见 `softmax_cudnn.cu` 的 `softmax_cudnn`），经测试驱动的
-`host_kernel` 通道复用**同一套 1e-5 判据与计时口径**，全量回归由 240 项变为 260 项。
-该 CMake 选项只决定“编不编、链不链”，**跑不跑**由 `main()` 的 `kEnableCudnnReference`
-决定（见上方开关表）；选项值会被 CMake 缓存，而 `option()` 的默认值只在**首次**
-configure 时写入 —— `build/` 若曾在关闭状态下 configure 过，改默认值不生效，须显式传
-`-DSOFTMAX_WITH_CUDNN=ON` 重新 configure（此后日常只改 `main.cu` 即可）。
+`host_kernel` 通道复用**同一套 1e-5 判据与计时口径**，并自动追加两项正常场景测试。
+该 CMake 选项只决定“编不编、链不链”；选项值会被 CMake 缓存，而 `option()` 的默认值
+只在**首次** configure 时写入 —— `build/` 若曾在关闭状态下 configure 过，须显式传
+`-DSOFTMAX_WITH_CUDNN=ON` 重新 configure。
 cuDNN 不属于 CUDA Toolkit，需单独获取；构建时按 `-DCUDNN_ROOT=<根目录>` > 环境变量
 `CUDNN_ROOT` > `CONDA_PREFIX` > `/usr/local/cuda`、`/usr` > pip 版 `nvidia-cudnn-cu12`
 （PyTorch 的依赖，落在 `site-packages/nvidia/cudnn` 下，含头文件与 `libcudnn.so.9`）
@@ -282,11 +280,11 @@ CMake 已做 glob 兜底并写入 rpath，运行时**无需**设置 `LD_LIBRARY_
 
 ### 严格基准综合对比（2026-09-10）
 
-下表为**严格档**（`enable_boundary=true` + `strict_benchmark=true`，100 次预热 +
-21 组 × 1000 次迭代取中位数，见 `docs/benchmark-methodology.md` §3.2）**当时已接入的
-9 个内核同一次运行**的结果，横向可比（该次运行早于 online-v3 / online-v3_false 接入，
-二者见后续各自的开发采样小节）。本次覆盖 A/B/C 三组共 20 场景 × 9 内核 = 180 项，
-全部 PASS（容差 1e-5），全程约 9 分 34 秒。有效带宽按逻辑数据量（每元素读 1 次 +
+下表为历史**严格采样**（100 次预热 + 21 组 × 1000 次迭代取中位数，见
+`docs/benchmark-methodology.md` §3.2）下当时已接入的 9 个内核同一次运行结果，横向可比
+（该次运行早于 online-v3 / online-v3_false 接入，二者见后续各自的开发采样小节）。历史
+全量测试为 20 场景 × 9 内核 = 180 项，全部 PASS（容差 1e-5），全程约 9 分 34 秒。
+有效带宽按逻辑数据量（每元素读 1 次 +
 写 1 次）。
 
 | 内核 | 4096×4096 ms | GB/s | 16384×1024 ms | GB/s | max_err (4096² / 16384×1024) |
