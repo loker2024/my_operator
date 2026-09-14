@@ -7,6 +7,18 @@
 
 ### Added
 
+- 2026-09-14 `operators/gemm`：接入 SGEMM v1 的原始模板实现测试
+  - `sgemm_v1.cuh` 的函数体保持原样，不使用共享内存；入口以 `BLOCKSIZE=32`、`grid=(ceil(M/32),ceil(N/32))`、`block=(1024,1)` 启动。`sgemm_v1.cu` 保留但不编译进默认目标。
+  - 默认入口仅运行 `512×512×512` 一个场景，并按 cuBLAS、v0、v1 的顺序输出。
+  - 回归结果：cuBLAS 与 v0 通过；v1 的 `max_err=1.000e+00`、错误元素数 253,952，未通过正确性验证，因此不记录性能结论。
+  - 文档同步：`operators/gemm/README.md`、根 `README.md`。
+
+- 2026-09-14 `operators/gemm`：新增 cuBLAS SGEMM 厂商库对照并收敛默认测试口径
+  - `operators/gemm/CMakeLists.txt`：GEMM 目标链接 `CUDA::cublas`；`test.cuh/.cu` 新增 `test_cublas_sgemm`，以行主序 `C=A×B` 与列主序 `C^T=B^T×A^T` 的等价映射调用 `cublasSgemm`，不产生额外转置或拷贝。
+  - 入口运行 `512×512×512` 一个正常场景；自定义内核与 cuBLAS 对照统一使用 CPU double 参考、相对误差 `≤1e-3`、1 次预热和 100 次 CUDA event 计时迭代。GEMM 报告仅保留中位数与 TFLOPS，不再计算或输出 P5/P95。
+  - cuBLAS 固定 `CUBLAS_PEDANTIC_MATH`，作为严格 FP32 对照；本机 RTX 4060 Laptop、CUDA 12.9、Release、sm_89 开发采样：v0 `1.8001 ms` / `0.149 TFLOPS` / `max_err=1.275e-06`，cuBLAS `0.0798 ms` / `3.366 TFLOPS` / `max_err=5.894e-07`，均通过。
+  - 文档同步：`operators/gemm/README.md`。
+
 - 2026-09-14 `operators/gemm`：接入 SGEMM v0 及可复用测试入口
   - 新增 `sgemm_v0.cuh`、`sgemm_reference.cuh/.cu`、`test.cuh/.cu` 与 `main.cu`：行主序 `C(M×N)=A(M×K)×B(K×N)`，CPU 参考以 double 累加；测试驱动用确定性正数输入、CUDA event 中位数/P5/P95 与逐元素相对误差 `≤1e-3` 统一验证并输出 TFLOPS。
   - `sgemm_v0`：每线程计算一个输出元素，固定 `block=(16,16)`、`grid=(ceil(M/16),ceil(N/16))`、无动态共享内存；补齐边界空转与 `C[row*N+col]` 写回。
@@ -23,6 +35,20 @@
   - 文档同步：`operators/softmax/README.md`（状态表新增「参考 / cuDNN」行、目录布局、开关表新增 `kEnableCudnnReference` 行并说明与 CMake 选项的分工、构建与运行新增 cuDNN 对照小节的开关用法与缓存说明、结论记录新增「cuDNN 厂商库对照」同场表）与根 `README.md`（构建与运行新增 `-DSOFTMAX_WITH_CUDNN` 构建开关说明）
 
 ### Fixed
+
+- 2026-09-14 仓库卫生：`.gitignore` 补充 `demo/` 就地编译产物的忽略规则
+  - 现象：`demo/demo_stream`、`demo/demo_utils` 两个无扩展名的 ELF 可执行文件曾被入库（`2c6e477`）。原 `.gitignore` 已覆盖 `build*/`、`*.o`、`*.a`、`*.so` 等，但无法匹配**无扩展名**的 Linux 可执行文件，`demo/` 下用 nvcc 就地编译出的产物每次都会落到 `git status` 里。
+  - 处理：`.gitignore` 新增 `/demo/*` 后放行 `!/demo/*.cu`、`!/demo/*.cuh` —— `demo/` 不接入 CMake、须 nvcc 就地编译（AGENTS.md §2），故整体忽略再白名单源码，新增示例无需再改 `.gitignore`。
+  - 验证：`git check-ignore -v --no-index` 对 `demo/demo_stream`、`demo/demo_utils`、`demo/helloWorld`（含尚未存在的 `demo/demo_attention`）均命中 `/demo/*`；`demo/*.cu`、`demo/*.cuh` 未被忽略，仍可正常入库。
+  - 遗留：两个二进制当前仍在 git 索引中，`.gitignore` 对已跟踪文件无效，本次提交需一并记录其删除（`git add -A demo/`）。
+  - 文档同步：`AGENTS.md`（§2 目录与构建约定）。
+
+- 2026-09-14 构建环境：消除构建缓存里的跨系统 Ninja 路径
+  - 现象：Windows PowerShell 下 `cmake --preset release` 在 `project()` 处失败，报 `Running '/mnt/d/Development/Vivado/2025.2/Vivado/bin/ninja' '--version' failed with: no such file or directory`；改在 WSL 内复用旧缓存时又会因缓存记录的系统路径不一致而拒绝。
+  - 根因：WSL 未安装原生 Ninja，CMake 经 WSL interop 抓到 Windows 的 `D:\Development\Vivado\2025.2\Vivado\bin\ninja.exe`，把 WSL 专有路径 `/mnt/d/...` 写进了 `build/`、`build-gemm/`、`build-gemm-cublas/`、`build-softmax-report/`、`build-softmax-report-cuda/` 五个构建目录的 `CMAKE_MAKE_PROGRAM`。
+  - 处理：WSL 安装 `ninja-build 1.11.1-2`（`/usr/bin/ninja`，PATH 中优先于 interop 目录）；删除被污染的 `build/CMakeCache.txt` 后重新 configure（`CMAKE_MAKE_PROGRAM:FILEPATH=/usr/bin/ninja`、`CMAKE_CUDA_COMPILER:FILEPATH=/usr/local/cuda/bin/nvcc`）；四个实验构建目录就地改写同一变量；顶层 `CMakeLists.txt` 新增 `CMAKE_HOST_WIN32` 守卫，明确 Windows 侧 CMake 不受支持。
+  - 验证：WSL 内 `cmake --preset release` 通过（CUDA Toolkit 12.9.86），`cmake --build build --target gemm reduce softmax` 通过，`gemm` 2/2 PASS（max_err 1.275e-06 / 5.894e-07）、`reduce` 16/16 PASS；Windows 侧 `cmake --preset release` 命中守卫并打印提示。
+  - 文档同步：根 `README.md`（环境要求）、`AGENTS.md`（§1 环境与构建）。
 
 - 2026-09-08 13:16 文档与注释同步
   - 根 `README.md` 更新 Reduce 的 v0…v7 与 80 项全量回归状态

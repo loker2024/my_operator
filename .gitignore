@@ -12,6 +12,13 @@ CMakeUserPresets.json
 *.out
 compile_commands.json
 
+# demo/：不接入 CMake 的 nvcc 就地编译示例（AGENTS.md §2）。
+# 产物与源码同名且无扩展名（demo_stream / demo_utils），只放行源码，
+# 避免编译出的 ELF 可执行文件再次入库。
+/demo/*
+!/demo/*.cu
+!/demo/*.cuh
+
 # 运行产生的数据文件
 *.bin
 *.raw

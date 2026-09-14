@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.24)
 
+# 本项目只有 WSL（Linux）原生一套工具链：nvcc / gcc 与构建缓存均按 Linux 路径生成。
+# Windows 侧 CMake 会误读缓存（曾把 /mnt/d/... 视为本机 Ninja 路径）而直接失败，故拒绝。
+if(CMAKE_HOST_WIN32)
+  message(FATAL_ERROR
+    "my_operator 只能在 WSL（Ubuntu-24.04）内构建：请在 WSL 终端执行 "
+    "cmake --preset release 与 cmake --build build，Windows 侧 CMake 不受支持。")
+endif()
+
 # CUDA 可选启用：先以 CXX 初始化工程，找到 Toolkit 后再开启 CUDA 语言，
 # 这样在没有 GPU/CUDA 的环境下也能完成文档级配置。
 project(my_operator LANGUAGES CXX)

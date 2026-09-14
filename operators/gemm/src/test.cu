@@ -1,14 +1,17 @@
 // ============================================================================
 // test.cu —— GEMM 可复用测试驱动（接口见 include/test.cuh）。
-// 流程：生成确定性输入与 CPU double 参考 → 分配并拷入设备缓冲 → 预热及 CUDA event
-// 采样 → 拷回逐元素校验 → 输出英文正确性和 TFLOPS 报告。入口与场景在 main.cu。
+// 流程：生成确定性输入与 CPU double 参考 → 分配并拷入设备缓冲 → 自定义内核或 cuBLAS
+// 预热及 CUDA event 采样 → 拷回逐元素校验 → 输出英文正确性和 TFLOPS 报告。入口与场景在 main.cu。
 // ============================================================================
+
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "include/test.cuh"
@@ -22,8 +25,6 @@ constexpr double kRelTol = 1e-3;
 
 struct TimingStats {
 	float median_ms = 0.0f;
-	float p5_ms = 0.0f;
-	float p95_ms = 0.0f;
 };
 
 struct CompareStats {
@@ -45,7 +46,7 @@ void FillDeterministicInput(std::vector<float>& values, int rows, int cols, int 
 	}
 }
 
-// 按统一口径采集每次内核调用耗时：连续 iterations 次平均后取样本中位数与 P5/P95。
+// 采集每次计算调用耗时：连续 iterations 次平均后取样本中位数。
 template <typename LaunchFn>
 TimingStats MeasureKernel(const LaunchFn& launch, int warmup_iterations, int iterations,
                           int sample_count) {
@@ -60,9 +61,15 @@ TimingStats MeasureKernel(const LaunchFn& launch, int warmup_iterations, int ite
 		samples[static_cast<std::size_t>(sample)] = timer.StopMs() / static_cast<float>(iterations);
 	}
 	std::sort(samples.begin(), samples.end());
-	return {samples[static_cast<std::size_t>(sample_count / 2)],
-	        samples[static_cast<std::size_t>((sample_count - 1) * 5 / 100)],
-	        samples[static_cast<std::size_t>((sample_count - 1) * 95 / 100)]};
+	return {samples[static_cast<std::size_t>(sample_count / 2)]};
+}
+
+// cuBLAS 状态没有 CUDA Runtime 的错误字符串，失败时输出数值状态并立即终止，避免继续
+// 使用无效 handle / 结果。调用点覆盖 handle 创建、模式设置、流绑定、GEMM 与销毁。
+void CheckCublas(cublasStatus_t status, const char* operation) {
+	if (status == CUBLAS_STATUS_SUCCESS) return;
+	std::fprintf(stderr, "cuBLAS error %d in %s\n", static_cast<int>(status), operation);
+	std::exit(EXIT_FAILURE);
 }
 
 // 对输出逐元素比较。NaN/Inf 或相对误差超过 1e-3 均失败，记录最大误差以便定位。
@@ -156,8 +163,7 @@ bool test_gemm_kernel(GemmKernel kernel, const char* kernel_name, int M, int N, 
 	    compare.max_rel_err, static_cast<long long>(compare.bad_count),
 	    compare.pass ? "PASS" : "FAIL");
 	std::printf("  CPU reference: %.3f ms\n", cpu_ms);
-	std::printf("  GPU time: median %.4f ms, P5/P95 %.4f/%.4f ms\n", gpu.median_ms, gpu.p5_ms,
-	            gpu.p95_ms);
+	std::printf("  GPU time: median %.4f ms\n", gpu.median_ms);
 	std::printf("  Throughput: %.3f TFLOPS (%d warmup, %d sample x %d iterations)\n", tflops,
 	            warmup_iterations, sample_count, iterations);
 	if (!compare.pass && compare.worst_idx >= 0) {
@@ -165,6 +171,86 @@ bool test_gemm_kernel(GemmKernel kernel, const char* kernel_name, int M, int N, 
 		std::printf("  Worst output: C[%zu] GPU %.6e / CPU %.6e\n", idx, h_gpu[idx], h_ref[idx]);
 	}
 
+	CUDA_CHECK(cudaFree(d_a));
+	CUDA_CHECK(cudaFree(d_b));
+	CUDA_CHECK(cudaFree(d_c));
+	return compare.pass;
+}
+
+bool test_cublas_sgemm(const char* test_name, int M, int N, int K, bool strict_benchmark) {
+	if (M < 0 || N < 0 || K < 0) {
+		std::printf("Test Case: %s\n  Result: FAIL (invalid shape)\n",
+		            test_name == nullptr ? "cublasSgemm" : test_name);
+		return false;
+	}
+
+	const int warmup_iterations = strict_benchmark ? 100 : 1;
+	const int iterations = strict_benchmark ? 1000 : 100;
+	const int sample_count = strict_benchmark ? 21 : 1;
+	const std::size_t a_count = static_cast<std::size_t>(M) * K;
+	const std::size_t b_count = static_cast<std::size_t>(K) * N;
+	const std::size_t c_count = static_cast<std::size_t>(M) * N;
+	if (c_count == 0) {
+		std::printf("Test Case: %s\n  Result: PASS (empty output; measurement skipped)\n",
+		            test_name == nullptr ? "cublasSgemm" : test_name);
+		return true;
+	}
+
+	std::vector<float> h_a(a_count);
+	std::vector<float> h_b(b_count);
+	std::vector<float> h_ref(c_count);
+	FillDeterministicInput(h_a, M, K, 13);
+	FillDeterministicInput(h_b, K, N, 97);
+	CpuTimer cpu_timer;
+	cpu_timer.Start();
+	sgemm_cpu(h_a.data(), h_b.data(), h_ref.data(), M, N, K);
+	const float cpu_ms = cpu_timer.StopMs();
+
+	float *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
+	CUDA_CHECK(cudaMalloc(&d_a, std::max(a_count, std::size_t{1}) * sizeof(float)));
+	CUDA_CHECK(cudaMalloc(&d_b, std::max(b_count, std::size_t{1}) * sizeof(float)));
+	CUDA_CHECK(cudaMalloc(&d_c, c_count * sizeof(float)));
+	if (a_count > 0)
+		CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), a_count * sizeof(float), cudaMemcpyHostToDevice));
+	if (b_count > 0)
+		CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), b_count * sizeof(float), cudaMemcpyHostToDevice));
+
+	cublasHandle_t handle = nullptr;
+	CheckCublas(cublasCreate(&handle), "cublasCreate");
+	CheckCublas(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH), "cublasSetMathMode");
+	CheckCublas(cublasSetStream(handle, nullptr), "cublasSetStream");
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	const auto launch = [&]() {
+		// 行主序 C=A×B 的内存等价于列主序 C^T=B^T×A^T；交换 A/B 与 M/N 即可避免转置。
+		CheckCublas(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_b, N, d_a, K,
+		                        &beta, d_c, N),
+		            "cublasSgemm");
+	};
+
+	const TimingStats gpu = MeasureKernel(launch, warmup_iterations, iterations, sample_count);
+	std::vector<float> h_gpu(c_count);
+	CUDA_CHECK(cudaMemcpy(h_gpu.data(), d_c, c_count * sizeof(float), cudaMemcpyDeviceToHost));
+	const CompareStats compare = CompareCellwise(h_ref, h_gpu);
+	const double tflops = 2.0 * static_cast<double>(M) * N * K / (gpu.median_ms * 1e9);
+
+	std::printf("Test Case: %s\n", test_name == nullptr ? "cublasSgemm" : test_name);
+	std::printf("  Shape: M=%d, N=%d, K=%d (row-major fp32)\n", M, N, K);
+	std::printf("  Library: cuBLAS, math mode CUBLAS_PEDANTIC_MATH\n");
+	std::printf(
+	    "  Correctness: max relative error %.3e (tolerance 1e-3), bad elements %lld -> %s\n",
+	    compare.max_rel_err, static_cast<long long>(compare.bad_count),
+	    compare.pass ? "PASS" : "FAIL");
+	std::printf("  CPU reference: %.3f ms\n", cpu_ms);
+	std::printf("  GPU time: median %.4f ms\n", gpu.median_ms);
+	std::printf("  Throughput: %.3f TFLOPS (%d warmup, %d sample x %d iterations)\n", tflops,
+	            warmup_iterations, sample_count, iterations);
+	if (!compare.pass && compare.worst_idx >= 0) {
+		const std::size_t idx = static_cast<std::size_t>(compare.worst_idx);
+		std::printf("  Worst output: C[%zu] GPU %.6e / CPU %.6e\n", idx, h_gpu[idx], h_ref[idx]);
+	}
+
+	CheckCublas(cublasDestroy(handle), "cublasDestroy");
 	CUDA_CHECK(cudaFree(d_a));
 	CUDA_CHECK(cudaFree(d_b));
 	CUDA_CHECK(cudaFree(d_c));

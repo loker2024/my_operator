@@ -17,6 +17,8 @@ CUDA 基础算子学习与实验仓库（MIT）。目标算子：**Softmax、GEM
 ## 1. 环境与构建
 
 - 开发机：RTX 4060 Laptop（Ada，**sm_89**）、CUDA 12.9。其他 GPU：`-DCMAKE_CUDA_ARCHITECTURES=native` 覆盖。
+- **构建只在 WSL（Ubuntu-24.04）内做**：CUDA / gcc 与构建缓存均为 Linux 路径，Windows 侧 CMake 被顶层 `CMakeLists.txt` 的 `CMAKE_HOST_WIN32` 守卫拒绝（此前 Windows CMake 读到缓存里的 `/mnt/d/.../ninja` 会报 `no such file or directory`）。
+- Ninja 用 WSL 原生版（`apt install ninja-build`）；缺装时 CMake 会经 interop 抓到 Windows 的 `ninja.exe`，把 `/mnt/d/...` 写进各构建目录缓存的 `CMAKE_MAKE_PROGRAM`。
 - CMake ≥ 3.24 + Ninja + C++17。顶层 `CMakeLists.txt` 先以 CXX 初始化、找到 CUDAToolkit 再 `enable_language(CUDA)`；无 GPU/CUDA 时也能完成文档级 configure。
 
 ```bash
@@ -30,7 +32,7 @@ cmake --build build --target <算子名>    # 目标名 = 算子目录名，如 
 - `common/` 共享宿主工具（头文件库）：`cuda_check.h`、`CpuTimer.h`、`GpuTimer.h`（GpuTimer 用 CUDA event，`StopMs` 前隐式同步）。
 - 算子目录标准布局：`README.md`（规划+状态+结论记录）、`src/`（`.cuh`/`.cu` + `test.cuh/.cu` + `main.cu`）、`notes/`（学习笔记）、`triton/`（第二阶段，规划目录）。
 - **CMake 门控**：算子目录 CMakeLists 判断 `src/main.cu` 是否存在——不存在则 configure 跳过。`src/*.cu` 以 `file(GLOB ... CONFIGURE_DEPENDS)` 自动纳入目标，**新增源文件不改 CMake**。
-- `demo/` 独立示例，可单独用 nvcc 编译，不接入顶层 CMake、不属于算子目标。
+- `demo/` 独立示例，可单独用 nvcc 编译，不接入顶层 CMake、不属于算子目标；**编译产物不入库**（`.gitignore` 忽略 `/demo/*`，仅放行 `.cu` / `.cuh`）。
 - `docs/benchmark-methodology.md` 定义统一测法；`docs/` 不放置个算子结论。
 
 ## 3. 开发工作准则（硬性）

@@ -14,3 +14,7 @@
 bool test_gemm_kernel(GemmKernel kernel, const char* kernel_name, int M, int N, int K, int grid_x,
                       int grid_y, int block_x, int block_y, std::size_t smem_bytes = 0,
                       bool strict_benchmark = false);
+
+// 以 cuBLAS 的严格 FP32 数学模式执行行主序 SGEMM 对照。参数 M/N/K 定义
+// C(M×N)=A(M×K)×B(K×N)，返回值表示 CPU 参考比较是否通过；无 CUDA 启动配置。
+bool test_cublas_sgemm(const char* test_name, int M, int N, int K, bool strict_benchmark = false);

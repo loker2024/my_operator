@@ -12,5 +12,7 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cu)
 endif()
 
 file(GLOB GEMM_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu)
+# v1 的默认测试入口使用头文件模板；保留 sgemm_v1.cu，不将其中的独立实现编入目标。
+list(REMOVE_ITEM GEMM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/sgemm_v1.cu)
 add_executable(gemm ${GEMM_SOURCES})
-target_link_libraries(gemm PRIVATE operator_common)
+target_link_libraries(gemm PRIVATE operator_common CUDA::cublas)
