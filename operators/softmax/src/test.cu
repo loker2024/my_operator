@@ -16,10 +16,10 @@
 #include <cstdio>     // printf
 #include <vector>     // std::vector
 
-#include "include/test.cuh"
 #include "operator_common/CpuTimer.h"    // 主机参考计时（std::chrono）
 #include "operator_common/GpuTimer.h"    // 内核计时（CUDA event）
 #include "operator_common/cuda_check.h"  // CUDA_CHECK 错误检查宏
+#include "include/test.cuh"
 
 namespace {
 
@@ -202,8 +202,11 @@ void PrintMismatchDetail(const RunReport& report) {
 // 设备快照由 GetDeviceInfo 缓存，故重复打印不重复查询 CUDA Runtime。
 void PrintReport(const RunReport& report) {
 	const DeviceInfo& device = GetDeviceInfo();
-	std::printf(
-	    "================================================================================\n");
+	//std::printf(
+	//
+	// 
+	// 
+	//     "================================================================================\n");
 	std::printf("Test Case: %s\n\n", report.kernel_name);
 
 	std::printf("GPU Configuration\n");

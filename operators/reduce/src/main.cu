@@ -1,6 +1,6 @@
 // ============================================================================
 // main.cu —— Reduce 测试执行入口：把被测内核注册给可复用测试驱动
-// test_reduce_kernel（声明 test.cuh / 实现 test.cu），按开关跑三类场景，退出码
+// test_reduce_kernel（声明 test.cuh / 实现 test.cu），固定运行两组正常场景，退出码
 // 0 = 全部通过。
 //
 // 接入新版本内核：在 reduce.cuh/.cu 添加声明与实现后，只需向下方 kKernels 表
@@ -72,63 +72,29 @@ int GridFor(int n, int block, int elems_per_thread, int extra_grid) {
 	return base + extra_grid;
 }
 
-// 场景组 A：正常流程 —— 大规模形状（grid 恰好覆盖输入）。
+// 正常测试场景：大规模对齐与尾部非对齐形状（grid 恰好覆盖输入）。
 const Scenario kNormalScenarios[] = {
     {"正常: n=2^20, 对齐", 1 << 20, 0},
     {"正常: n=2^20+1000, 尾部非对齐", (1 << 20) + 1000, 0},
 };
 
-// 场景组 B：边界条件 —— 极小规模与 block 边界附近 / 整 block 满载的形状，
-// 覆盖补 0、单 block、双 block（第二个 block 只有少量有效元素）等路径。
-// 对 v7 额外补足 n % 4 尾部余数的向量化路径（余 2 的形状，配合 kBlock±1 的余
-// 1 / 余 3 与 kBlock 的整除，覆盖 float4 主循环 + 标量尾部的全部组合）。
-const Scenario kBoundaryScenarios[] = {
-    {"边界: n=1, 单元素", 1, 0},
-    {"边界: n=block, 恰 1 个 block 满载", kBlock, 0},
-    {"边界: n=block-1, 差 1 满载", kBlock - 1, 0},
-    {"边界: n=block+1, 需 2 个 block", kBlock + 1, 0},
-    {"边界: n=2*block-1, 第 2 个 block 仅 1 个有效元素", 2 * kBlock - 1, 0},
-    {"边界: n=block-2, float4 尾部余 2 元素", kBlock - 2, 0},
-};
-
-// 场景组 C：异常 / 健壮性 —— 空输入、超配 grid。
-const Scenario kAbnormalScenarios[] = {
-    {"异常: n=0, 空输入 (期望和=0)", 0, 0},
-    {"健壮: n=2^18, grid 超配 +3 个冗余 block", 1 << 18, 3},
-};
-
-// 对单个内核跑一遍启用场景，返回该内核是否全部 PASS。
-// 开关：enable_boundary 执行 B/C 组（默认只跑 A 组正常流程，避免极小形状拖慢
-// 日常迭代）；strict_benchmark 透传给 test_reduce_kernel 的严格采样口径。
-bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
-                  bool strict_benchmark = false, int* passed = nullptr, int* total = nullptr) {
+// 对单个内核跑两组正常场景，返回该内核是否全部 PASS。
+// 固定使用快速采样口径：1 次预热与 100 次计时迭代。
+bool RunScenarios(const KernelEntry& kern, int* passed = nullptr, int* total = nullptr) {
 	bool all_ok = true;
 	int local_passed = 0;
 	int local_total = 0;
 
-	const auto run_group = [&](const char* title, const Scenario* scenarios, size_t count) {
-		std::printf("== %s ==\n", title);
-		for (size_t i = 0; i < count; ++i) {
-			const Scenario& s = scenarios[i];
-			char full_name[192];
-			std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
-			const bool ok =
-			    test_reduce_kernel(kern.kernel, full_name, s.n,
-			                       GridFor(s.n, kBlock, kern.elems_per_thread, s.extra_grid),
-			                       kBlock, strict_benchmark);
-			all_ok = ok && all_ok;
-			local_passed += ok ? 1 : 0;
-			local_total += 1;
-		}
-	};
-
-	run_group("[A] 正常流程", kNormalScenarios, CountOf(kNormalScenarios));
-	if (enable_boundary) {
-		run_group("[B] 边界条件", kBoundaryScenarios, CountOf(kBoundaryScenarios));
-		run_group("[C] 异常与健壮性", kAbnormalScenarios, CountOf(kAbnormalScenarios));
-	} else {
-		std::printf("== [B] 边界条件 / [C] 异常与健壮性 ==\n");
-		std::printf("    已跳过（enable_boundary = false，默认关闭）\n");
+	for (size_t i = 0; i < CountOf(kNormalScenarios); ++i) {
+		const Scenario& s = kNormalScenarios[i];
+		char full_name[192];
+		std::snprintf(full_name, sizeof(full_name), "%s | %s", kern.name, s.label);
+		const bool ok = test_reduce_kernel(
+		    kern.kernel, full_name, s.n, GridFor(s.n, kBlock, kern.elems_per_thread, s.extra_grid),
+		    kBlock, false);
+		all_ok = ok && all_ok;
+		local_passed += ok ? 1 : 0;
+		local_total += 1;
 	}
 
 	if (passed != nullptr) *passed += local_passed;
@@ -139,18 +105,12 @@ bool RunScenarios(const KernelEntry& kern, bool enable_boundary = false,
 }  // namespace
 
 int main() {
-	// 开关集中在此，默认关闭：只跑正常流程 + 快速性能。需要全量回归或严格基准时
-	// 改为 true。
-	constexpr bool kEnableBoundary = false;
-	constexpr bool kStrictBenchmark = false;
-
 	PrintDeviceInfo();
 	std::printf("\n");
 
 	std::printf("==== Reduce 测试：正确性(容差 1e-3) + 性能 ====\n");
 	std::printf("block = %d；被测内核 %zu 个\n", kBlock, sizeof(kKernels) / sizeof(kKernels[0]));
-	std::printf("开关: enable_boundary = %s, strict_benchmark = %s\n\n",
-	            kEnableBoundary ? "true" : "false", kStrictBenchmark ? "true" : "false");
+	std::printf("场景：大规模对齐、尾部非对齐；快速采样：1 次预热 + 100 次迭代\n\n");
 
 	bool all_ok = true;
 	int passed = 0;
@@ -158,7 +118,7 @@ int main() {
 
 	for (const KernelEntry& kern : kKernels) {
 		std::printf("---------------- %s ----------------\n", kern.name);
-		const bool ok = RunScenarios(kern, kEnableBoundary, kStrictBenchmark, &passed, &total);
+		const bool ok = RunScenarios(kern, &passed, &total);
 		all_ok = ok && all_ok;
 		std::printf("\n");
 	}

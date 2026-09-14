@@ -45,6 +45,9 @@
 
 ### Changed
 
+- 2026-09-14 `operators/reduce`：测试入口固定为两组正常场景的快速正确性与性能测试
+  - `src/main.cu`：删除 `kEnableBoundary`、`kStrictBenchmark`、边界/健壮性场景和 `[A]` / `[B]` / `[C]` 分组输出；8 个内核固定运行大规模对齐与尾部非对齐形状，`test_reduce_kernel` 固定使用快速采样（1 次预热 + 100 次迭代）。
+  - `operators/reduce/README.md` 与根 `README.md`：同步入口只运行 16 项正常场景；历史严格基准表保留并标注为历史记录。
 - 2026-09-14 `operators/softmax`：每个测试报告前打印 GPU 指标并统一报告结构
   - `src/test.cu`：新增进程内缓存的 CUDA Runtime 设备快照；每次 `test_softmax_kernel`
     调用固定输出 `Test Case`、`GPU Configuration`、`Launch Configuration`、`Results`、

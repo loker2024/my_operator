@@ -222,37 +222,9 @@ online-v1）；online-v4 每 block 经 grid-stride 循环处理多行 →
 `__shared__` 中转，`float4` 向量化只影响行内访问）；v4/v5 每行一个 block →
 `grid = rows`、动态共享内存 `cols * sizeof(float)`（随列宽增长，`main.cu` 的 `SmemFor`
 需按列宽传入 —— v4 缓存整行 x、v5 缓存整行 exp）。
-每内核覆盖三类场景：
-
-- **正常流程**：`4096×4096`、`16384×1024`；
-- **边界条件**：`1×1`，行数在 block 线程覆盖边界附近的 `(block±1)`、恰满载的
-  `block`、末 block 仅余 1 行的 `(2*block-1)`（v0 与 online-v0 的关键路径，列宽 3），以及行宽在
-  行内协作边界附近的 `3×(block±1)`、恰 1 轮满载的 `3×block`、第 2 轮仅余 1 列的
-  `3×(2*block-1)`、warp 边界附近的 `3×(32±1)` / `3×32`（v2/v3/v4/v5 与 online-v1/online-v2/online-v4 的
-  关键路径
-  —— 覆盖
-  空转线程、多轮 stride 与整 warp 空转的归约单位元路径，online-v1 在此走「空子集
-  `(m = -inf, d = 0)` 参与二元组合并」的路径；其中非 4 倍列宽场景对
-  v3/v4/v5 与 online-v2/online-v4 走标量回退），以及 float4 对齐边界 `3×[4×(block±1)]` / `3×(4×block)` /
-  `3×[4×(2*block-1)]`（v3/v4/v5 与 online-v2/online-v4 向量化主循环在 block 线程数附近 —— 空转 / 恰 1 轮
-  满载 /
-  第 2 轮余 1 个 / 余 `block-1` 个 `float4`，列宽均为 4 的倍数）；其中行数边界组
-  （行数 ≤ `2*block` < grid-stride 上限）对 online-v4 走「`grid = rows`、一行一 block」
-  的退化路径，grid-stride「同一 block 处理多行」路径由正常流程组（rows 4096 / 16384 >
-  上限）覆盖；
-- **异常 / 健壮性**：`0×1024` 空矩阵（越界空转）、`3×0` 空行（遍历 0 次、不写）。
-
-开关（在 `main()` 中集中设置）：
-
-| 开关 | 默认 | 作用 |
-| --- | --- | --- |
-| `enable_boundary` | `false` | 是否执行“边界条件”与“异常 / 健壮性”场景（经 `RunScenarios` 透传）；关闭时每内核只跑正常流程（2 项），开启后全量回归 20 项/内核（12 内核共 240 项；叠加 cuDNN 对照参考后为 13 组共 260 项） |
-| `strict_benchmark` | `false` | 是否按严格口径采样（透传给 `test_softmax_kernel` 的同名参数，与 reduce 测试一致）：关闭时 1 次预热 + 100 次迭代；开启时 100 次预热 + 21 组 × 1000 次并输出 P5/P95 |
-| `kEnableCudnnReference` | `true` | 是否运行 cuDNN 对照参考段（该常量只在 `SOFTMAX_WITH_CUDNN` 打开的构建里存在）。与 CMake 选项分工：**CMake 选项决定“编不编、链不链”**（链接期依赖，须构建前定），**本开关决定“跑不跑”**；CMake 的值会被缓存（`option()` 默认值只在首次 configure 写入，缓存里是 `OFF` 时须显式传 `=ON`），配一次之后日常只改这里 |
-
-日常开发保持前两个默认即可（只跑有性能意义的大规模形状）；出严格基准数字或做全量
-回归时，把 `main()` 中对应常量改为 `true`；想临时去掉 cuDNN 对照段则把
-`kEnableCudnnReference` 改为 `false`（无需重新 configure）。
+每个自研内核固定覆盖两组正常场景：`4096×4096`、`16384×1024`。入口固定使用快速
+采样（1 次预热 + 100 次迭代），每次运行执行 12 个内核 × 2 个场景 = 24 项测试。
+若以 `SOFTMAX_WITH_CUDNN=ON` 编译，cuDNN 参考会自动追加相同两组正常场景，共 26 项。
 
 测试驱动（`src/test.cu`）的运行时文案统一为**英文**。每个 `kernel × scenario` 输出都是
 独立的 `Test Case` 块，固定按 `GPU Configuration` → `Launch Configuration` → `Results` →
