@@ -7,6 +7,12 @@
 
 ### Added
 
+- 2026-09-14 `operators/gemm`：接入 SGEMM v0 及可复用测试入口
+  - 新增 `sgemm_v0.cuh`、`sgemm_reference.cuh/.cu`、`test.cuh/.cu` 与 `main.cu`：行主序 `C(M×N)=A(M×K)×B(K×N)`，CPU 参考以 double 累加；测试驱动用确定性正数输入、CUDA event 中位数/P5/P95 与逐元素相对误差 `≤1e-3` 统一验证并输出 TFLOPS。
+  - `sgemm_v0`：每线程计算一个输出元素，固定 `block=(16,16)`、`grid=(ceil(M/16),ceil(N/16))`、无动态共享内存；补齐边界空转与 `C[row*N+col]` 写回。
+  - 默认入口运行 `512×512×512` 与 `513×511×509` 两组快速场景（1 次预热 + 100 次迭代）；在本机 RTX 4060 Laptop、CUDA 12.9、Release、sm_89 下均通过，最大相对误差为 `1.275e-06` / `1.293e-06`。
+  - 文档同步：`operators/gemm/README.md`、根 `README.md`。
+
 - 2026-09-11 16:36 softmax：接入 cuDNN 厂商库对照参考（`-DSOFTMAX_WITH_CUDNN`，默认开启）
   - `operators/softmax/CMakeLists.txt`：新增 `SOFTMAX_WITH_CUDNN` 选项，按 `-DCUDNN_ROOT` > 环境变量 `CUDNN_ROOT` > `CONDA_PREFIX` > `/usr/local/cuda`、`/usr` > pip 版 `nvidia-cudnn-cu12`（`site-packages/nvidia/cudnn`）的顺序探测；pip / conda 版只提供带 SONAME 的 `libcudnn.so.9`（无 `libcudnn.so` 软链、不在 `ldconfig` 视界内），`find_library` 匹配不到时用 `file(GLOB)` 兜底，并写入 rpath 免设 `LD_LIBRARY_PATH`；选项默认开启（本机已装 cuDNN），未装时用 `-DSOFTMAX_WITH_CUDNN=OFF` 关闭，否则 configure 直接报错提示 `-DCUDNN_ROOT`
   - `operators/softmax/src/softmax.cuh` / `.cu`：新增 `SoftmaxHostKernel` 别名与 `softmax_cudnn`（`cudnnSoftmaxForward` + `CUDNN_SOFTMAX_ACCURATE` + `CUDNN_SOFTMAX_MODE_INSTANCE`），把行主序 `M×N` 映射为 `[n=M, c=1, h=1, w=N]` + `nStride=N`；句柄与张量描述符进程内复用、绑定默认流，`M <= 0 || N <= 0` 直接返回，错误经 `SOFTMAX_CUDNN_CHECK` 打印后终止

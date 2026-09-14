@@ -14,7 +14,7 @@
 | 算子 | 说明 | CUDA 核心版 | Triton 版 | 目录 |
 | --- | --- | --- | --- | --- |
 | Softmax | fp32，行主序、逐行归一化 | 进行中（v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4 完成） | 规划中 | `operators/softmax` |
-| GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 规划中 | 规划中 | `operators/gemm` |
+| GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 进行中（v0 完成） | 规划中 | `operators/gemm` |
 | Attention | 单头、fp32、无 mask | 规划中 | 规划中 | `operators/attention` |
 | Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 完成（v0…v7） | 规划中 | `operators/reduce` |
 
@@ -38,7 +38,7 @@ my_operator/
 │   │   ├── README.md           # 规划 + 状态 + 结论记录
 │   │   ├── CMakeLists.txt      # 出现 src/main.cu 后自动启用（各算子同一约定）
 │   │   └── src/                # CUDA 实现：各版本独立 .cuh/.cu、公共归约、参考、测试与入口
-│   ├── gemm/                   # SGEMM：CUDA → Triton（骨架，结构同 softmax）
+│   ├── gemm/                   # SGEMM：CUDA → Triton（v0 已接入测试）
 │   ├── attention/              # Attention：CUDA → Triton（骨架，结构同 softmax）
 │   └── reduce/                 # Reduce：CUDA 核心版 v0…v7 已实现
 │       ├── README.md           # 规划 + 状态 + 结论记录
@@ -79,10 +79,11 @@ operators/<name>/
 # 1. 创建源码，例如 operators/softmax/src/main.cu（及其它 .cu/.cuh）
 # 2. 重新 configure（新增/删除文件后必须重新执行）
 cmake --preset release
-# 3. 构建并运行（当前 reduce / softmax 已创建 src/main.cu，其余算子目标自动跳过）
-cmake --build build --target softmax reduce   # 目标名 = 算子目录名
+# 3. 构建并运行（当前 reduce / softmax / gemm 已创建 src/main.cu）
+cmake --build build --target softmax reduce gemm   # 目标名 = 算子目录名
 ./build/operators/softmax/softmax
 ./build/operators/reduce/reduce
+./build/operators/gemm/gemm
 ```
 
 运行该可执行文件即执行该算子的「正确性验证 + 性能基准」，打印通过/失败与耗时统计（失败时返回非零退出码，便于脚本化）。
