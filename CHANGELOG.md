@@ -18,6 +18,15 @@
   - 扫描产物：`--bench` 24 点全部成功，CSV / PNG 落在 `operators/gemm/bench/20260915192408/`；v2 相对 v1 的加速为 512³ 1.49×、1024³ 1.65×、2048³ 1.65×、4096³ 1.60×，约为 cuBLAS 的 1/5。
   - 文档同步：`operators/gemm/README.md`（状态表与规划说明改为共享内存分块、原「v2 向量化 / 每线程多元素」顺延为 v3、结论记录新增 v2 行与含 v2 的多尺寸曲线章节）、根 `README.md`（GEMM 进度改为 v0、v1、v2 完成）。
 
+### Changed
+
+- 2026-09-15 19:47 `operators/gemm`：模板参数 `BLOCKSIZE` 重命名为 `TILE_SIZE`
+  - `include/sgemm_v1.cuh` / `include/sgemm_v2.cuh`：模板参数与全部注释改用 `TILE_SIZE` —— 该常量是输出 tile 边长（`TILE_SIZE×TILE_SIZE`），同时决定静态共享内存大小（`2·TILE_SIZE²·4` B）、k 方向步长与 grid 划分；原名容易被读成「block 线程数」，而每 block 线程数其实是 `TILE_SIZE²`（v1 / v2 下为 1024）。纯重命名，语义与启动配置不变。
+  - `main.cu`：`kSgemmV1BlockSize` / `kSgemmV2BlockSize` → `kSgemmV1TileSize` / `kSgemmV2TileSize`；`kSgemmV*Threads`（= `TILE_SIZE²`）与注册项的 `block=(1024,1)`、tile `32×32`、smem 0 B 均不变，内核描述字符串同步为 `TILE_SIZE=32`。
+  - `src/sgemm_v1.cu` / `src/sgemm_v2.cu`：占位注释里的模板签名同步。
+  - 文档同步：`operators/gemm/README.md`（3 处 `BLOCKSIZE` 改为 `TILE_SIZE`）。`CHANGELOG.md` 的历史条目保留原名，记录的是当时的命名。
+  - 回归：`cmake --build build --target gemm` 通过，`./build/operators/gemm/gemm` 4/4 PASS（v2 `max_err=1.275e-06`、中位 `0.3034 ms` / `0.885 TFLOPS`；v1 `0.3966 ms` / `0.677 TFLOPS`；同属 1 预热 + 100 次迭代的快速采样，与重命名前同量级）。
+
 - 2026-09-15 15:06 `operators/gemm`：新增 `--bench` 用法文档 `notes/bench-usage.md`
   - 新建 `operators/gemm/notes/bench-usage.md`：整理扫描模式的完整用法 —— 编译与入口区分（无参数 = 正确性 + 性能，`--bench` = 只计时）、`--sizes/--csv/--warmup/--budget` 参数表与约束、真实终端输出样例（`--sizes 128 --budget 50` 实测）、CSV 列定义与产物落点、绘图脚本命令、计时口径（自适应迭代的由来与严格对比口径的差别）、常见坑（相对路径落点、`--sizes` 非法值、退出码 0/1/2、样本量随尺寸缩水）。
   - `test.cu`：补齐扫描路径的函数级注释 —— 文件头说明 `bench_gemm_kernel` / `bench_cublas_sgemm` 只计时不校验；两个函数上方写明各参数用法（`warmup_iterations` 空转次数、`budget_ms` 只反推每组迭代数且采样组数固定 3 组、`iters_out` 回传样本量）与返回值语义（中位数 ms，非法/启动失败返回 -1.0）。
