@@ -12,7 +12,8 @@ CUDA 基础算子学习与实验仓库（MIT）。目标算子：**Softmax、GEM
 |---|---|---|
 | Reduce | 完成 | v0…v7，全量回归 80 项通过 |
 | Softmax | 进行中 | v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4 完成，全量回归 240 项通过 |
-| GEMM / Attention | 骨架规划中 | 无 `src/main.cu`，configure 自动跳过 |
+| GEMM | 进行中 | v0、v1 完成（入口固定 `512×512×512`，3/3 通过） |
+| Attention | 骨架规划中 | 无 `src/main.cu`，configure 自动跳过 |
 
 ## 1. 环境与构建
 
@@ -33,6 +34,7 @@ cmake --build build --target <算子名>    # 目标名 = 算子目录名，如 
 - 算子目录标准布局：`README.md`（规划+状态+结论记录）、`src/`（`.cuh`/`.cu` + `test.cuh/.cu` + `main.cu`）、`notes/`（学习笔记）、`triton/`（第二阶段，规划目录）。
 - **CMake 门控**：算子目录 CMakeLists 判断 `src/main.cu` 是否存在——不存在则 configure 跳过。`src/*.cu` 以 `file(GLOB ... CONFIGURE_DEPENDS)` 自动纳入目标，**新增源文件不改 CMake**。
 - `demo/` 独立示例，可单独用 nvcc 编译，不接入顶层 CMake、不属于算子目标；**编译产物不入库**（`.gitignore` 忽略 `/demo/*`，仅放行 `.cu` / `.cuh`）。
+- `scripts/` 仓库级 Python 工具（跨算子复用）：`plot_kernel_perf.py` 把 bench CSV 画成性能曲线，只要求 CSV 含 `label,size,gflops` 列（GEMM `--bench` 直接产出该格式）；依赖见 `scripts/requirements.txt`。扫描产物（CSV + 图）落在各算子目录的 `bench/<时间戳>/` 下、每次扫描一个目录，并入库作结论证据；README 配图直接引用对应时间戳目录里的 PNG。
 - `docs/benchmark-methodology.md` 定义统一测法；`docs/` 不放置个算子结论。
 
 ## 3. 开发工作准则（硬性）

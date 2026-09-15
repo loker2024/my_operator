@@ -7,10 +7,28 @@
 
 ### Added
 
+- 2026-09-15 15:06 `operators/gemm`：新增 `--bench` 用法文档 `notes/bench-usage.md`
+  - 新建 `operators/gemm/notes/bench-usage.md`：整理扫描模式的完整用法 —— 编译与入口区分（无参数 = 正确性 + 性能，`--bench` = 只计时）、`--sizes/--csv/--warmup/--budget` 参数表与约束、真实终端输出样例（`--sizes 128 --budget 50` 实测）、CSV 列定义与产物落点、绘图脚本命令、计时口径（自适应迭代的由来与严格对比口径的差别）、常见坑（相对路径落点、`--sizes` 非法值、退出码 0/1/2、样本量随尺寸缩水）。
+  - `test.cu`：补齐扫描路径的函数级注释 —— 文件头说明 `bench_gemm_kernel` / `bench_cublas_sgemm` 只计时不校验；两个函数上方写明各参数用法（`warmup_iterations` 空转次数、`budget_ms` 只反推每组迭代数且采样组数固定 3 组、`iters_out` 回传样本量）与返回值语义（中位数 ms，非法/启动失败返回 -1.0）。
+  - 文档同步：`operators/gemm/README.md`（「性能可视化」补指向用法文档的入口）。
+
+- 2026-09-15 14:58 `operators/gemm`：bench 产物改为按时间戳分目录
+  - `main.cu`：`--bench` 未指定 `--csv` 时，CSV 默认写到 `operators/gemm/bench/<YYYYmmddHHMMSS>/gemm_bench.csv`（`localtime_r` 取扫描时刻），每次扫描独占一个目录，同一台机器上多次运行不再互相覆盖；`--csv` 仍可覆盖路径，父目录按需创建、不可写时退回 stdout 的逻辑不变。
+  - `scripts/plot_kernel_perf.py`：PNG 默认与输入 CSV 同目录同名，随 CSV 一起落入时间戳目录；新增重复点校验 —— 同一 `(label, size)` 出现两次即报错并提示只传单次扫描的 CSV（防止用通配符把多次扫描混成一张图时静默叠加数据点）。
+  - 产物调整：删除旧路径 `bench/gemm_bench.csv|png`，改为 `bench/20260915145532/gemm_bench.csv|png`（表、图、CSV 三者同源）。
+  - 文档同步：`operators/gemm/README.md`（性能可视化命令与产物落点说明、结论记录配图链接与采样波动说明）、根 `README.md`（命令示例与产物路径）、`AGENTS.md`（§2 约定 `bench/<时间戳>/`）。
+
+- 2026-09-15 14:10 `operators/gemm`：新增 `--bench` 多尺寸性能扫描与仓库级绘图脚本
+  - `test.cuh` / `test.cu`：新增 `bench_gemm_kernel` 与 `bench_cublas_sgemm` —— 只分配设备缓冲（输入以 0 填充）并做 CUDA event 计时，不生成主机端输入、不做 CPU 参考与结果回拷；迭代数按预算自适应（1 次调用估计单次耗时 → 每组迭代数 = clamp(200 ms/点预算内的调用数, 1, 100) → 连采 3 组取中位数）。固定 100 次迭代在朴素 v0 的 4096³（单次约 0.95 s）上会让单个采样点耗掉数分钟。内核启动失败返回负值，由调用方跳过该点，不终止整轮扫描。
+  - `main.cu`：新增 `--bench [--sizes 128,256,...] [--csv <path>] [--warmup <n>] [--budget <ms>]`，默认扫 `128,256,512,1024,2048,4096`；`KernelEntry` 拆出短名 `plot_name`（图例/CSV）与 `description`（正确性报告），CSV 表头为 `label,size,median_ms,gflops,iters`；输出父目录按需创建，路径不可写时退回 stdout；部分采样点失败只打印 `SKIPPED` 并继续，全部失败才返回非 0。无参数时的「正确性 + 性能」流程与输出保持不变。
+  - 新增 `scripts/plot_kernel_perf.py`（+ `scripts/requirements.txt`）：读 bench CSV 画「GFLOP/s vs 矩阵尺寸」多内核对比图，样式对齐参考图（灰底白网格、等宽字体、分类等距刻度 + 45° 旋转标签、线末端同色文字标注，默认配色 `#F8766D / #00BA38 / #619CFF`），并提供 `--palette / --title / --xlabel / --ylabel / --label-col / --x-col / --y-col` 等覆盖项；只依赖 CSV 的列名，其他算子可复用。
+  - 回归与采样：默认入口 `3/3 PASS` 不变；`--bench` 18 个采样点全部成功（整轮约 9 s）。GFLOP/s 结果、采样说明与生成的性能曲线见 `operators/gemm/README.md`「结论记录」，CSV / PNG 复现产物入库到 `operators/gemm/bench/`。
+  - 文档同步：`operators/gemm/README.md`（扫描口径、目录布局补 `bench/`、新增「性能可视化」小节与多尺寸曲线表）、根 `README.md`（目录树补 `scripts/`、环境要求补 Python 依赖、构建与运行补 bench + 绘图命令）、`AGENTS.md`（§2 补 `scripts/` 约定）。
+
 - 2026-09-14 `operators/gemm`：接入 SGEMM v1 的原始模板实现测试
   - `sgemm_v1.cuh` 的函数体保持原样，不使用共享内存；入口以 `BLOCKSIZE=32`、`grid=(ceil(M/32),ceil(N/32))`、`block=(1024,1)` 启动。`sgemm_v1.cu` 保留但不编译进默认目标。
   - 默认入口仅运行 `512×512×512` 一个场景，并按 cuBLAS、v0、v1 的顺序输出。
-  - 回归结果：cuBLAS 与 v0 通过；v1 的 `max_err=1.000e+00`、错误元素数 253,952，未通过正确性验证，因此不记录性能结论。
+  - 回归结果：cuBLAS 与 v0 通过；v1 记为 `max_err=1.000e+00`、错误元素数 253,952，未通过正确性验证，因此未记录性能结论。（2026-09-15 复核：该数值源于物理 block 只起 32 线程的启动配置错误，v1 索引映射本身正确，见当日条目。）
   - 文档同步：`operators/gemm/README.md`、根 `README.md`。
 
 - 2026-09-14 `operators/gemm`：新增 cuBLAS SGEMM 厂商库对照并收敛默认测试口径
@@ -35,6 +53,14 @@
   - 文档同步：`operators/softmax/README.md`（状态表新增「参考 / cuDNN」行、目录布局、开关表新增 `kEnableCudnnReference` 行并说明与 CMake 选项的分工、构建与运行新增 cuDNN 对照小节的开关用法与缓存说明、结论记录新增「cuDNN 厂商库对照」同场表）与根 `README.md`（构建与运行新增 `-DSOFTMAX_WITH_CUDNN` 构建开关说明）
 
 ### Fixed
+
+- 2026-09-15 13:50 `operators/gemm`：更正 v1 结论并补齐 v1 源码注释
+  - 复核：`./build/operators/gemm/gemm` 当前 3/3 PASS，v1 为 `max_err=1.275e-06`、中位 `0.3630 ms` / `0.740 TFLOPS`（同日三次采样 0.3513–0.3811 ms；同场 v0 `1.8651 ms` / `0.144 TFLOPS`、cuBLAS `0.0657 ms` / `4.088 TFLOPS`）—— 2026-09-14 记录的「v1 未通过正确性验证」不再成立。
+  - 根因定位：以 `block=(32,1)` 启动能复现与旧记录逐位一致的 `max_err=1.000e+00`、错误元素数 253,952（每 block 只写出 `32×32` tile 首行 → 8192 项正确、253,952 项未写入，未写入区为 0 时相对误差恰为 `1.000e+00`）；v1 的线性索引映射本身正确，故障来自物理 block 未给满 `BLOCKSIZE² = 1024` 个线程。
+  - 形状复核：按现有注册方式（`grid=(ceil(M/32),ceil(N/32))`、`block=(1024,1)`）另测 `513×511×509`、`32×32×32`、`33×1×1`、`1×1×1`、`1024×1024×1024` 全部 PASS（`max_err ≤ 1.89e-06`）。
+  - `sgemm_v1.cuh`：补 `#pragma once`、文件头模块说明与函数级注释（作用 / 参数 / 返回值 / 启动约束 / 注意事项，含「线程数不足 `BLOCKSIZE²` 时只覆盖 tile 首行且不报错」这一坑）；计算逻辑不变，仅按 `.clang-format` 规范化排版（Tab 缩进、运算符空格、超长签名换行）。
+  - `sgemm_v1.cu`：原为 0 字节裸文件，补占位说明（v1 实现内联在 `.cuh`，本文件被 `CMakeLists.txt` 的 `list(REMOVE_ITEM)` 排除在 gemm 目标之外）。
+  - 文档同步：`operators/gemm/README.md`（v1 状态改「完成（已接入测试）」、版本规划补启动约束、结论记录补 v1 行与同场采样噪声说明、更正旧失败叙述）、根 `README.md`（GEMM 状态、目录树与路线图）、`AGENTS.md`（§0 现状速览拆出 GEMM / Attention 两行）。
 
 - 2026-09-14 仓库卫生：`.gitignore` 补充 `demo/` 就地编译产物的忽略规则
   - 现象：`demo/demo_stream`、`demo/demo_utils` 两个无扩展名的 ELF 可执行文件曾被入库（`2c6e477`）。原 `.gitignore` 已覆盖 `build*/`、`*.o`、`*.a`、`*.so` 等，但无法匹配**无扩展名**的 Linux 可执行文件，`demo/` 下用 nvcc 就地编译出的产物每次都会落到 `git status` 里。

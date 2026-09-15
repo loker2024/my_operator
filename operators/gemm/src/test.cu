@@ -93,6 +93,60 @@ CompareStats CompareCellwise(const std::vector<float>& reference, const std::vec
 	return stats;
 }
 
+struct SweepTiming {
+	double median_ms = -1.0;
+	int iters = 0;
+};
+
+// 扫描模式的设备缓冲：只分配，输入以 0 填充（避免未初始化内存里的 NaN / 非规格化数
+// 干扰 fp32 吞吐），析构时释放。扫描只统计耗时，不需要主机端生成输入与结果回拷，
+// 省掉大尺寸下数十秒的 CPU 参考与逐元素比较。
+struct SweepBuffers {
+	float* a = nullptr;
+	float* b = nullptr;
+	float* c = nullptr;
+
+	~SweepBuffers() {
+		if (a != nullptr) cudaFree(a);
+		if (b != nullptr) cudaFree(b);
+		if (c != nullptr) cudaFree(c);
+	}
+};
+
+// 扫描模式的计时策略（对应 test.cuh 的描述）：预热 → 1 次调用估计单次耗时 → 每组
+// 迭代数 = clamp(budget_ms 内的调用数 / 采样组数, 1, 100) → 采 3 组取单次耗时中位数。
+// launch 返回 false 表示启动失败，立即放弃该采样点；异步执行错误（如越界访存）仍由
+// GpuTimer::StopMs 的隐式同步检出并按 CUDA_CHECK 处理。
+template <typename LaunchFn>
+SweepTiming MeasureKernelAdaptive(const LaunchFn& launch, int warmup_iterations, double budget_ms) {
+	constexpr int kSampleCount = 3;
+	constexpr int kMaxItersPerSample = 100;
+	for (int i = 0; i < warmup_iterations; ++i) {
+		if (!launch()) return {};
+	}
+	CUDA_CHECK(cudaDeviceSynchronize());
+
+	GpuTimer probe;
+	probe.Start();
+	if (!launch()) return {};
+	const double single_ms = std::max(static_cast<double>(probe.StopMs()), 1e-6);
+
+	int iters = static_cast<int>(std::lround(budget_ms / (single_ms * kSampleCount)));
+	iters = std::min(std::max(iters, 1), kMaxItersPerSample);
+
+	std::vector<float> samples(static_cast<std::size_t>(kSampleCount));
+	for (int sample = 0; sample < kSampleCount; ++sample) {
+		GpuTimer timer;
+		timer.Start();
+		for (int i = 0; i < iters; ++i) {
+			if (!launch()) return {};
+		}
+		samples[static_cast<std::size_t>(sample)] = timer.StopMs() / static_cast<float>(iters);
+	}
+	std::sort(samples.begin(), samples.end());
+	return {samples[static_cast<std::size_t>(kSampleCount / 2)], iters};
+}
+
 }  // namespace
 
 bool test_gemm_kernel(GemmKernel kernel, const char* kernel_name, int M, int N, int K, int grid_x,
@@ -255,4 +309,74 @@ bool test_cublas_sgemm(const char* test_name, int M, int N, int K, bool strict_b
 	CUDA_CHECK(cudaFree(d_b));
 	CUDA_CHECK(cudaFree(d_c));
 	return compare.pass;
+}
+
+double bench_gemm_kernel(const void* kernel, int M, int N, int K, int grid_x, int grid_y,
+                         int block_x, int block_y, std::size_t smem_bytes, int warmup_iterations,
+                         double budget_ms, int* iters_out) {
+	// 与 test_gemm_kernel 同一份参数契约；M/N/K 必须非零，否则没有可测的计算。
+	if (kernel == nullptr || M < 1 || N < 1 || K < 1 || grid_x < 1 || grid_y < 1 || block_x < 1 ||
+	    block_y < 1 || budget_ms <= 0.0) {
+		return -1.0;
+	}
+
+	SweepBuffers buffers;
+	// cudaMalloc 的字节数由 int 维度相乘得到，先按 size_t 提升再乘，避免大尺寸下 int 溢出。
+	const std::size_t a_bytes = static_cast<std::size_t>(M) * K * sizeof(float);
+	const std::size_t b_bytes = static_cast<std::size_t>(K) * N * sizeof(float);
+	CUDA_CHECK(cudaMalloc(&buffers.a, a_bytes));
+	CUDA_CHECK(cudaMalloc(&buffers.b, b_bytes));
+	CUDA_CHECK(cudaMalloc(&buffers.c, static_cast<std::size_t>(M) * N * sizeof(float)));
+	CUDA_CHECK(cudaMemset(buffers.a, 0, a_bytes));
+	CUDA_CHECK(cudaMemset(buffers.b, 0, b_bytes));
+
+	const float* d_a_arg = buffers.a;
+	const float* d_b_arg = buffers.b;
+	float* d_c_arg = buffers.c;
+	int m_arg = M;
+	int n_arg = N;
+	int k_arg = K;
+	void* args[] = {&d_a_arg, &d_b_arg, &d_c_arg, &m_arg, &n_arg, &k_arg};
+	// 启动失败只返回 false，交由调用方跳过该点；此处不用 CUDA_CHECK 终止整轮扫描。
+	const auto launch = [&]() -> bool {
+		return cudaLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(grid_x, grid_y),
+		                        dim3(block_x, block_y), args, smem_bytes) == cudaSuccess;
+	};
+
+	const SweepTiming timing = MeasureKernelAdaptive(launch, warmup_iterations, budget_ms);
+	if (iters_out != nullptr) *iters_out = timing.iters;
+	return timing.median_ms;
+}
+
+double bench_cublas_sgemm(int M, int N, int K, int warmup_iterations, double budget_ms,
+                          int* iters_out) {
+	if (M < 1 || N < 1 || K < 1 || budget_ms <= 0.0) {
+		return -1.0;
+	}
+
+	SweepBuffers buffers;
+	const std::size_t a_bytes = static_cast<std::size_t>(M) * K * sizeof(float);
+	const std::size_t b_bytes = static_cast<std::size_t>(K) * N * sizeof(float);
+	CUDA_CHECK(cudaMalloc(&buffers.a, a_bytes));
+	CUDA_CHECK(cudaMalloc(&buffers.b, b_bytes));
+	CUDA_CHECK(cudaMalloc(&buffers.c, static_cast<std::size_t>(M) * N * sizeof(float)));
+	CUDA_CHECK(cudaMemset(buffers.a, 0, a_bytes));
+	CUDA_CHECK(cudaMemset(buffers.b, 0, b_bytes));
+
+	cublasHandle_t handle = nullptr;
+	CheckCublas(cublasCreate(&handle), "cublasCreate");
+	CheckCublas(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH), "cublasSetMathMode");
+	CheckCublas(cublasSetStream(handle, nullptr), "cublasSetStream");
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	// 行主序 C=A×B 等价于列主序 C^T=B^T×A^T，与 test_cublas_sgemm 的映射保持一致。
+	const auto launch = [&]() -> bool {
+		return cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, buffers.b, N,
+		                   buffers.a, K, &beta, buffers.c, N) == CUBLAS_STATUS_SUCCESS;
+	};
+
+	const SweepTiming timing = MeasureKernelAdaptive(launch, warmup_iterations, budget_ms);
+	CheckCublas(cublasDestroy(handle), "cublasDestroy");
+	if (iters_out != nullptr) *iters_out = timing.iters;
+	return timing.median_ms;
 }

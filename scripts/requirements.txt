@@ -1,0 +1,4 @@
+# scripts/ 下 Python 脚本的依赖（绘图用）。
+# 安装：python3 -m pip install -r scripts/requirements.txt
+matplotlib>=3.6
+numpy>=1.24
