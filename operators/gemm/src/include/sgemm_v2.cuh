@@ -24,8 +24,8 @@
 template <const int TILE_SIZE>
 __global__ void sgemm_v2(const float* A, const float* B, float* C, const int M, const int N,
                          const int K) {
-	__shared__ float shared_A[TILE_SIZE * TILE_SIZE];  // A 的 tile，沿 k 方向向右滑动
-	__shared__ float shared_B[TILE_SIZE * TILE_SIZE];  // B 的 tile，沿 k 方向向下滑动
+	__shared__ float sharedA[TILE_SIZE * TILE_SIZE];  // A 的 tile，沿 k 方向向右滑动
+	__shared__ float sharedB[TILE_SIZE * TILE_SIZE];  // B 的 tile，沿 k 方向向下滑动
 
 	const int cRow = blockIdx.x;  // 本 block 的输出 tile 行号
 	const int cCol = blockIdx.y;  // 本 block 的输出 tile 列号
@@ -45,14 +45,14 @@ __global__ void sgemm_v2(const float* A, const float* B, float* C, const int M, 
 	float sum = 0.0f;
 
 	for (int bkIdx = 0; bkIdx < K; bkIdx += TILE_SIZE) {
-		shared_A[threadRow * TILE_SIZE + threadCol] =
+		sharedA[threadRow * TILE_SIZE + threadCol] =
 		    (globalRow < M && bkIdx + threadCol < K) ? A[threadRow * K + threadCol] : 0.0f;
-		shared_B[threadRow * TILE_SIZE + threadCol] =
+		sharedB[threadRow * TILE_SIZE + threadCol] =
 		    (bkIdx + threadRow < K && globalCol < N) ? B[threadRow * N + threadCol] : 0.0f;
 		__syncthreads();
 
 		for (int k = 0; k < TILE_SIZE; ++k) {
-			sum += shared_A[threadRow * TILE_SIZE + k] * shared_B[k * TILE_SIZE + threadCol];
+			sum += sharedA[threadRow * TILE_SIZE + k] * sharedB[k * TILE_SIZE + threadCol];
 		}
 		__syncthreads();
 
