@@ -7,6 +7,17 @@
 
 ### Added
 
+- 2026-09-15 19:30 `operators/gemm`：新增共享内存分块版 SGEMM v2 并接入测试
+  - `include/sgemm_v2.cuh`：新增 `sgemm_v2<BLOCKSIZE>` 模板内核（内联在头文件 —— `-rdc=false` 下跨翻译单元引用 `__global__` 模板特化已被 nvcc 弃用）。一个 block 以 `BLOCKSIZE²` 个线性线程覆盖 `BLOCKSIZE×BLOCKSIZE` 输出 tile，k 方向按 tile 把 A / B 搬进静态共享内存（BLOCKSIZE=32 时 8 KiB，动态共享内存仍为 0 B）；M / N 越界线程空转，K 非 BLOCKSIZE 倍数时尾块补 0，K == 0 时输出写 0。启动约束 `block=(BLOCKSIZE²,1)`、`grid=(ceil(M/BLOCKSIZE),ceil(N/BLOCKSIZE))`。
+  - 修正写回位置：C 的写回原先放在 k 循环内，512³ / BLOCKSIZE=32 时每线程多写 15 次全量 C（约 15 MB 额外全局写）；移到循环外后只在末尾写一次。
+  - 补齐注释：文件头说明（模板内联的原因、tile 复用带来的访存量变化）与函数注释（作用 / 参数 / 返回值 / 启动约束 / 注意事项），满足新增 `.cuh` 不得裸提交与不得缺启动约束的要求。
+  - 清理：`src/sgemm_v2.cu` 原为 0 字节空文件，改为与 `sgemm_v1.cu` 一致的注释占位文件（写明实现内联在 `.cuh`、由 `main.cu` 显式实例化，以及为何不需要 CMake 排除）；`operators/gemm/CMakeLists.txt` 回滚为 `add_executable(gemm ${GEMM_SOURCES})`（去掉重复列出 `src/sgemm_v2.cu` 的改动 —— GLOB 已覆盖 `src/*.cu`）。
+  - `main.cu`：包含 `sgemm_v2.cuh`，以 `BLOCKSIZE=32` 实例化 `sgemm_v2<32>` 并注册进 `kKernels`（`block=(1024,1)`、tile `32×32`、smem 0 B）。
+  - 回归：`./build/operators/gemm/gemm` 由 3 项变 4 项、4/4 PASS；v2 在 `512×512×512` 为 `max_err=1.275e-06`、中位 `0.2660 ms` / `1.009 TFLOPS`（复测 0.2609 ms），同场 v1 `0.3750 ms` / `0.716 TFLOPS`、v0 `1.8980 ms` / `0.141 TFLOPS`、cuBLAS `0.0666 ms` / `4.028 TFLOPS`。
+  - 形状复核：临时加入 `513×511×509`、`33×33×33`、`1×1×1` 三个场景，8 内核·场景组合 16/16 PASS（尾块与退化尺寸均通过），验证后恢复默认单场景 `512×512×512`。
+  - 扫描产物：`--bench` 24 点全部成功，CSV / PNG 落在 `operators/gemm/bench/20260915192408/`；v2 相对 v1 的加速为 512³ 1.49×、1024³ 1.65×、2048³ 1.65×、4096³ 1.60×，约为 cuBLAS 的 1/5。
+  - 文档同步：`operators/gemm/README.md`（状态表与规划说明改为共享内存分块、原「v2 向量化 / 每线程多元素」顺延为 v3、结论记录新增 v2 行与含 v2 的多尺寸曲线章节）、根 `README.md`（GEMM 进度改为 v0、v1、v2 完成）。
+
 - 2026-09-15 15:06 `operators/gemm`：新增 `--bench` 用法文档 `notes/bench-usage.md`
   - 新建 `operators/gemm/notes/bench-usage.md`：整理扫描模式的完整用法 —— 编译与入口区分（无参数 = 正确性 + 性能，`--bench` = 只计时）、`--sizes/--csv/--warmup/--budget` 参数表与约束、真实终端输出样例（`--sizes 128 --budget 50` 实测）、CSV 列定义与产物落点、绘图脚本命令、计时口径（自适应迭代的由来与严格对比口径的差别）、常见坑（相对路径落点、`--sizes` 非法值、退出码 0/1/2、样本量随尺寸缩水）。
   - `test.cu`：补齐扫描路径的函数级注释 —— 文件头说明 `bench_gemm_kernel` / `bench_cublas_sgemm` 只计时不校验；两个函数上方写明各参数用法（`warmup_iterations` 空转次数、`budget_ms` 只反推每组迭代数且采样组数固定 3 组、`iters_out` 回传样本量）与返回值语义（中位数 ms，非法/启动失败返回 -1.0）。

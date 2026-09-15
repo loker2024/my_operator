@@ -23,6 +23,7 @@
 
 #include "include/sgemm_v0.cuh"
 #include "include/sgemm_v1.cuh"
+#include "include/sgemm_v2.cuh"
 #include "include/test.cuh"
 
 namespace {
@@ -33,6 +34,10 @@ constexpr int kBlockY = 16;
 // sgemm_v1.cuh 的原始线性线程映射：BLOCKSIZE 是输出 tile 边长，需由 32×32 个线程覆盖。
 constexpr int kSgemmV1BlockSize = 32;
 constexpr int kSgemmV1Threads = kSgemmV1BlockSize * kSgemmV1BlockSize;
+// sgemm_v2.cuh 的共享内存分块版：同样是 BLOCKSIZE² 个线性线程覆盖 BLOCKSIZE² 的输出 tile，
+// k 方向按 tile 步进，共享内存静态分配（不计入动态共享内存）。
+constexpr int kSgemmV2BlockSize = 32;
+constexpr int kSgemmV2Threads = kSgemmV2BlockSize * kSgemmV2BlockSize;
 
 // 启动配置 —— 物理 block、grid 覆盖的输出 tile 与动态共享内存字节数，以各版本 .cuh 的
 // 启动约束为准。v1 的物理 block 为 1024×1，但每 block 覆盖 32×32 个输出元素。
@@ -62,6 +67,10 @@ const KernelEntry kKernels[] = {
      "sgemm_v1 (BLOCKSIZE=32, original global-memory implementation)",
      reinterpret_cast<const void*>(sgemm_v1<kSgemmV1BlockSize>),
      {kSgemmV1Threads, 1, kSgemmV1BlockSize, kSgemmV1BlockSize, 0}},
+    {"sgemm_v2",
+     "sgemm_v2 (BLOCKSIZE=32, shared-memory tiling, one thread per output)",
+     reinterpret_cast<const void*>(sgemm_v2<kSgemmV2BlockSize>),
+     {kSgemmV2Threads, 1, kSgemmV2BlockSize, kSgemmV2BlockSize, 0}},
 };
 
 struct Scenario {
