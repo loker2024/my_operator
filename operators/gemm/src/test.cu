@@ -1,7 +1,6 @@
 // ============================================================================
-// test.cu —— GEMM 可复用测试驱动（接口见 include/test.cuh）。
-// 流程：生成确定性输入与 CPU double 参考 → 分配并拷入设备缓冲 → 自定义内核或 cuBLAS
-// 预热及 CUDA event 采样 → 拷回逐元素校验 → 输出英文正确性和 TFLOPS 报告。入口与场景在 main.cu。
+// test.cu —— GEMM 测试驱动实现：确定性输入、CPU double 参考、CUDA event 采样、
+// 逐元素校验与英文报告（接口见 include/test.cuh，入口与场景在 main.cu）。
 // ============================================================================
 
 #include <cublas_v2.h>
@@ -34,8 +33,7 @@ struct CompareStats {
 	bool pass = true;
 };
 
-// 用行、列与输入矩阵角色生成可复现的正数，避免随机引擎差异和正负乘积相消令参考值
-// 接近 0（相对误差分母极小会放大正常的 fp32 累加舍入误差）。
+// 用行列索引与 salt 生成 1/1000…1 的可复现正数输入。
 void FillDeterministicInput(std::vector<float>& values, int rows, int cols, int salt) {
 	for (int row = 0; row < rows; ++row) {
 		for (int col = 0; col < cols; ++col) {
@@ -64,8 +62,7 @@ TimingStats MeasureKernel(const LaunchFn& launch, int warmup_iterations, int ite
 	return {samples[static_cast<std::size_t>(sample_count / 2)]};
 }
 
-// cuBLAS 状态没有 CUDA Runtime 的错误字符串，失败时输出数值状态并立即终止，避免继续
-// 使用无效 handle / 结果。调用点覆盖 handle 创建、模式设置、流绑定、GEMM 与销毁。
+// cuBLAS 调用失败时打印数值状态码并立即终止。
 void CheckCublas(cublasStatus_t status, const char* operation) {
 	if (status == CUBLAS_STATUS_SUCCESS) return;
 	std::fprintf(stderr, "cuBLAS error %d in %s\n", static_cast<int>(status), operation);
@@ -98,9 +95,7 @@ struct SweepTiming {
 	int iters = 0;
 };
 
-// 扫描模式的设备缓冲：只分配，输入以 0 填充（避免未初始化内存里的 NaN / 非规格化数
-// 干扰 fp32 吞吐），析构时释放。扫描只统计耗时，不需要主机端生成输入与结果回拷，
-// 省掉大尺寸下数十秒的 CPU 参考与逐元素比较。
+// 扫描模式用的设备缓冲：只负责分配与释放。
 struct SweepBuffers {
 	float* a = nullptr;
 	float* b = nullptr;
@@ -113,10 +108,10 @@ struct SweepBuffers {
 	}
 };
 
-// 扫描模式的计时策略（对应 test.cuh 的描述）：预热 → 1 次调用估计单次耗时 → 每组
-// 迭代数 = clamp(budget_ms 内的调用数 / 采样组数, 1, 100) → 采 3 组取单次耗时中位数。
-// launch 返回 false 表示启动失败，立即放弃该采样点；异步执行错误（如越界访存）仍由
-// GpuTimer::StopMs 的隐式同步检出并按 CUDA_CHECK 处理。
+// 扫描模式的计时：预热 → 1 次调用估计单次耗时 → 每组迭代数 = clamp(预算内的调用数 /
+// kSampleCount, 1, kMaxItersPerSample) → 采 kSampleCount 组取单次耗时中位数。
+// launch 返回 false 表示启动失败，立即放弃该采样点；异步执行错误由 GpuTimer::StopMs 的
+// 隐式同步检出（CUDA_CHECK 处理）。
 template <typename LaunchFn>
 SweepTiming MeasureKernelAdaptive(const LaunchFn& launch, int warmup_iterations, double budget_ms) {
 	constexpr int kSampleCount = 3;
@@ -165,6 +160,7 @@ bool test_gemm_kernel(GemmKernel kernel, const char* kernel_name, int M, int N, 
 	const std::size_t a_count = static_cast<std::size_t>(M) * K;
 	const std::size_t b_count = static_cast<std::size_t>(K) * N;
 	const std::size_t c_count = static_cast<std::size_t>(M) * N;
+	// 空输出：直接判通过，跳过计时与比较。
 	if (c_count == 0) {
 		std::printf("Test Case: %s\n  Result: PASS (empty output; measurement skipped)\n",
 		            kernel_name);
@@ -196,6 +192,7 @@ bool test_gemm_kernel(GemmKernel kernel, const char* kernel_name, int M, int N, 
 	int m_arg = M;
 	int n_arg = N;
 	int k_arg = K;
+	// 内核参数按 (A, B, C, M, N, K) 打包，通过 cudaLaunchKernel 按给定配置启动。
 	void* args[] = {&d_a_arg, &d_b_arg, &d_c_arg, &m_arg, &n_arg, &k_arg};
 	const auto launch = [&]() {
 		CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(grid_x, grid_y),
@@ -314,14 +311,14 @@ bool test_cublas_sgemm(const char* test_name, int M, int N, int K, bool strict_b
 double bench_gemm_kernel(const void* kernel, int M, int N, int K, int grid_x, int grid_y,
                          int block_x, int block_y, std::size_t smem_bytes, int warmup_iterations,
                          double budget_ms, int* iters_out) {
-	// 与 test_gemm_kernel 同一份参数契约；M/N/K 必须非零，否则没有可测的计算。
+	// 形状与启动配置契约同 test_gemm_kernel；M / N / K 必须为正。
 	if (kernel == nullptr || M < 1 || N < 1 || K < 1 || grid_x < 1 || grid_y < 1 || block_x < 1 ||
 	    block_y < 1 || budget_ms <= 0.0) {
 		return -1.0;
 	}
 
 	SweepBuffers buffers;
-	// cudaMalloc 的字节数由 int 维度相乘得到，先按 size_t 提升再乘，避免大尺寸下 int 溢出。
+	// 先按 size_t 提升再相乘，避免大尺寸下 int 溢出。
 	const std::size_t a_bytes = static_cast<std::size_t>(M) * K * sizeof(float);
 	const std::size_t b_bytes = static_cast<std::size_t>(K) * N * sizeof(float);
 	CUDA_CHECK(cudaMalloc(&buffers.a, a_bytes));

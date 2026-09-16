@@ -1,14 +1,8 @@
 // ============================================================================
-// main.cu —— GEMM 入口，两条运行路径：
-//   1) 无参数：固定场景的正确性验证 + 性能基准（先 cuBLAS 对照，再各被测内核）；
-//   2) `--bench`：多尺寸性能扫描，只计时不做正确性校验，最后输出 CSV 供绘图脚本使用。
-// 后续版本只需在同名 .cuh/.cu 中实现 GemmKernel 签名，再向 kKernels 追加一项（短名、
-// 描述、内核地址、启动配置）即可同时接入两条路径；模板内核须在此处显式指定模板实参。
-// 构建：cmake --build build --target gemm
-// 运行：./build/operators/gemm/gemm
-//       ./build/operators/gemm/gemm --bench [--sizes 128,256,...] [--csv <path>]
-//                                   [--warmup <n>] [--budget <ms>]
-// --bench 默认把 CSV 写到 operators/gemm/bench/<时间戳>/gemm_bench.csv（--csv 可覆盖）。
+// main.cu —— GEMM 入口：默认对固定场景做正确性验证 + 性能基准（先 cuBLAS 对照，再各被测
+// 内核）；`--bench` 走多尺寸性能扫描，只计时并把结果写成 CSV。
+// 接入新内核：向 kKernels 追加一项（短名、描述、内核地址、启动配置），模板内核在此显式指定
+// 模板实参。
 // ============================================================================
 
 #include <cstddef>
@@ -28,19 +22,17 @@
 
 namespace {
 
-// sgemm_v0 的启动配置（每线程一个输出，见 include/sgemm_v0.cuh）：block 16×16 铺 M×N。
+// sgemm_v0 的启动配置：block 16×16 铺 M×N，每线程一个输出元素。
 constexpr int kBlockX = 16;
 constexpr int kBlockY = 16;
-// sgemm_v1.cuh 的原始线性线程映射：TILE_SIZE 是输出 tile 边长，需由 32×32 个线程覆盖。
+// sgemm_v1 的启动配置：每 block 起满 TILE_SIZE² 个线性线程覆盖一个输出 tile。
 constexpr int kSgemmV1TileSize = 32;
 constexpr int kSgemmV1Threads = kSgemmV1TileSize * kSgemmV1TileSize;
-// sgemm_v2.cuh 的共享内存分块版：同样是 TILE_SIZE² 个线性线程覆盖 TILE_SIZE² 的输出 tile，
-// k 方向按 tile 步进，共享内存静态分配（不计入动态共享内存）。
+// sgemm_v2 的启动配置：同 v1，共享内存为静态分配（不计入动态共享内存）。
 constexpr int kSgemmV2TileSize = 32;
 constexpr int kSgemmV2Threads = kSgemmV2TileSize * kSgemmV2TileSize;
 
-// 启动配置 —— 物理 block、grid 覆盖的输出 tile 与动态共享内存字节数，以各版本 .cuh 的
-// 启动约束为准。v1 的物理 block 为 1024×1，但每 block 覆盖 32×32 个输出元素。
+// 一次启动的配置：物理 block、每 block 覆盖的输出 tile 与动态共享内存字节数。
 struct LaunchConfig {
 	int block_x;
 	int block_y;
@@ -87,8 +79,7 @@ const Scenario kNormalScenarios[] = {
 
 // ---- 扫描模式（--bench）的默认配置 ----
 const char* const kCublasPlotName = "cuBLAS";
-// 默认尺寸序列：128…4096 的正方形矩阵，覆盖从带宽受限到计算受限的过程，与性能曲线图的
-// 等距刻度一致（画图时按分类轴处理，不按数值轴）。
+// 默认尺寸序列：128…4096 的正方形矩阵（绘图脚本按等距分类轴处理这些尺寸）。
 const int kDefaultSweepSizes[] = {128, 256, 512, 1024, 2048, 4096};
 // 默认产物落点：operators/gemm/bench/<扫描时刻>/gemm_bench.csv，每次扫描单开一个目录。
 const char* const kDefaultCsvDir = "operators/gemm/bench";
@@ -118,8 +109,7 @@ int DivUp(int value, int divisor) {
 	return (value + divisor - 1) / divisor;
 }
 
-// 默认 CSV 路径：operators/gemm/bench/<YYYYmmddHHMMSS>/gemm_bench.csv —— 按扫描时刻分目录，
-// 同一台机器上的多次扫描互不覆盖；绘图脚本默认把 PNG 写在同名 CSV 的旁边。
+// 默认 CSV 路径：operators/gemm/bench/<YYYYmmddHHMMSS>/gemm_bench.csv —— 按扫描时刻分目录。
 std::string DefaultCsvPath() {
 	const std::time_t now = std::time(nullptr);
 	std::tm local_time = {};
@@ -194,7 +184,7 @@ void RecordPoint(std::vector<BenchPoint>* points, const char* label, int size, d
 }
 
 // 写出 CSV（表头 label,size,median_ms,gflops,iters）；先按需创建父目录，路径不可写时
-// 退回标准输出，保证 `gemm --bench | python3 scripts/plot_kernel_perf.py` 之类的管道仍可用。
+// 退回标准输出。
 void WriteCsv(const std::vector<BenchPoint>& points, const std::string& path) {
 	std::error_code dir_error;
 	const std::filesystem::path parent = std::filesystem::path(path).parent_path();

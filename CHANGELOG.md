@@ -20,6 +20,23 @@
 
 ### Changed
 
+- 2026-09-16 10:55 `operators/gemm`：按 `.codebuddy/rules/注释规则.mdc` 整理 gemm 其余代码文件的注释
+  - `include/sgemm_v0.cuh` / `src/sgemm_v0.cu`：声明处删去启动约束（block / grid / 0 B 动态共享内存）与 1e-3 容差说明，文件头收敛为「行主序 + 每线程一个输出元素」；函数体补坐标映射行尾注释与 K 方向累加说明。
+  - `include/sgemm_v1.cuh`：文件头删去模板内联原因与 warp 访问模式叙述（warp 行为移入 README）；契约收敛为 `TILE_SIZE` 语义 + 「每 block 必须起满 `TILE_SIZE²` 个线程」。
+  - `src/sgemm_v1.cu`：占位注释由 6 行收敛为 3 行（保留 CMake 排除现状与启用前提）。
+  - `include/sgemm_reference.cuh` / `src/sgemm_reference.cu`：文件头精简为职责一句话，删去「不作为性能基线」等定位说明。
+  - `include/test.cuh`：删去扫描模式的策略与背景长注（逐点校验的代价、固定迭代的耗时），保留 `strict_benchmark` 语义与返回契约；迭代自适应细节由实现承担。
+  - `src/test.cu`：输入生成、cuBLAS 错误处理、扫描缓冲、自适应计时与 bench 契约注释改为「做什么」表述；补空输出、内核参数打包两处行为注释；原因类信息（确定性正数输入、0 填充、自适应迭代）移入 README。
+  - `src/main.cu`：文件头删去构建 / 运行命令与两条路径详解；启动配置、CSV 落点、管道用法等注释收敛（写入失败退回标准输出的行为保留）。
+  - `operators/gemm/README.md`：承接移出的文档类信息 —— 确定性正数输入的原因、v1 的 warp 访问模式、扫描缓冲 0 填充的原因。
+  - 验证：`clang-format --dry-run --Werror` 对 11 个源码文件全部干净；`cmake --build build --target gemm` 通过；`./build/operators/gemm/gemm` 4/4 PASS（v0 2.1400 ms、v1 0.3896 ms、v2 0.2458 ms / 1.092 TFLOPS、cuBLAS 0.0624 ms）。
+
+- 2026-09-16 10:48 `operators/gemm`：按 `.codebuddy/rules/注释规则.mdc` 重写 sgemm_v2 源码注释
+  - `include/sgemm_v2.cuh`：文件头与函数声明处的「作用 / 参数 / 返回值 / 启动约束 / 注意事项」模板收敛为文件头两行说明 + 函数前两行契约（`TILE_SIZE` 语义与「每 block 必须起满 `TILE_SIZE²` 个线程」）；删去模板内联原因、共享内存字节数、`__syncthreads` 必要性、warp 访问模式与 1e-3 容差等推导 / 性能 / 背景叙述（启动配置由 `main.cu` 的记录承担）；函数体按「做什么」重写：拆分行列坐标、指针移到 tile 左上角、装载 tile 越界补 0、共享内存乘加、指针前进、合法范围写回，并删除 `A / B / C` 指针的行尾坐标注释（与统一注释重复）。
+  - `src/sgemm_v2.cu`：占位注释由 6 行收敛为 2 行，`-rdc=false` 弃用原因与 CMake 排除说明移出源码。
+  - `operators/gemm/README.md`：「版本规划说明」的 v2 条目补记模板定义内联在 `.cuh`、由 `main.cu` 显式实例化的原因（`-rdc=false` 下跨翻译单元引用 `__global__` 模板特化已被 nvcc 弃用），承接从源码移出的文档类信息。
+  - 验证：`cmake --build build --target gemm` 通过、`git diff` 核对为纯注释 / 文档改动；`./build/operators/gemm/gemm` 4/4 PASS（v2 `max_err=1.275e-06`、中位 0.2667 ms / 1.007 TFLOPS）。
+
 - 2026-09-15 19:47 `operators/gemm`：模板参数 `BLOCKSIZE` 重命名为 `TILE_SIZE`
   - `include/sgemm_v1.cuh` / `include/sgemm_v2.cuh`：模板参数与全部注释改用 `TILE_SIZE` —— 该常量是输出 tile 边长（`TILE_SIZE×TILE_SIZE`），同时决定静态共享内存大小（`2·TILE_SIZE²·4` B）、k 方向步长与 grid 划分；原名容易被读成「block 线程数」，而每 block 线程数其实是 `TILE_SIZE²`（v1 / v2 下为 1024）。纯重命名，语义与启动配置不变。
   - `main.cu`：`kSgemmV1BlockSize` / `kSgemmV2BlockSize` → `kSgemmV1TileSize` / `kSgemmV2TileSize`；`kSgemmV*Threads`（= `TILE_SIZE²`）与注册项的 `block=(1024,1)`、tile `32×32`、smem 0 B 均不变，内核描述字符串同步为 `TILE_SIZE=32`。
