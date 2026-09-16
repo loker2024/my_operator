@@ -14,7 +14,7 @@
 | 算子 | 说明 | CUDA 核心版 | Triton 版 | 目录 |
 | --- | --- | --- | --- | --- |
 | Softmax | fp32，行主序、逐行归一化 | 进行中（v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4 完成） | 规划中 | `operators/softmax` |
-| GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 进行中（v0、v1、v2 完成） | 规划中 | `operators/gemm` |
+| GEMM | fp32 SGEMM，`C = A(M×K) · B(K×N)` | 进行中（v0、v1、v2、v3 完成） | 规划中 | `operators/gemm` |
 | Attention | 单头、fp32、无 mask | 规划中 | 规划中 | `operators/attention` |
 | Reduce | fp32 一维整体求和（标量），将扩展行/列/全局归约 | 完成（v0…v7） | 规划中 | `operators/reduce` |
 
@@ -38,7 +38,7 @@ my_operator/
 │   │   ├── README.md           # 规划 + 状态 + 结论记录
 │   │   ├── CMakeLists.txt      # 出现 src/main.cu 后自动启用（各算子同一约定）
 │   │   └── src/                # CUDA 实现：各版本独立 .cuh/.cu、公共归约、参考、测试与入口
-│   ├── gemm/                   # SGEMM：CUDA → Triton（v0、v1、v2 完成）
+│   ├── gemm/                   # SGEMM：CUDA → Triton（v0、v1、v2、v3 完成）
 │   ├── attention/              # Attention：CUDA → Triton（骨架，结构同 softmax）
 │   └── reduce/                 # Reduce：CUDA 核心版 v0…v7 已实现
 │       ├── README.md           # 规划 + 状态 + 结论记录
@@ -72,7 +72,7 @@ operators/<name>/
 - NVIDIA GPU + CUDA Toolkit（开发机为 RTX 4060 Laptop，Ada 架构 sm_89，CUDA 12.9）
 - CMake ≥ 3.24
 - Ninja：须为 WSL 内安装的原生版（`sudo apt install ninja-build`）。缺失时 CMake 会经 interop 抓到 Windows 的 `ninja.exe`，把 `/mnt/d/...` 这类跨系统路径写进构建缓存的 `CMAKE_MAKE_PROGRAM`。
-- Python 3 + matplotlib：仅 `scripts/` 下的绘图脚本需要，安装命令 `python3 -m pip install -r scripts/requirements.txt`。
+- Python 3 + matplotlib：仅 `scripts/` 下的绘图脚本需要；统一使用项目根目录的 `.venv/`，配置见 [`docs/python-environment.md`](docs/python-environment.md)。
 - 支持 C++17 的编译器（gcc / clang）
 
 ## 构建与运行
@@ -97,7 +97,7 @@ GEMM 额外提供 `--bench` 性能扫描模式（只计时、不做正确性校�
 ```bash
 ./build/operators/gemm/gemm --bench     # 默认扫 128/256/512/1024/2048/4096 正方形尺寸
 # 产物：operators/gemm/bench/<时间戳>/gemm_bench.csv（终端会打印实际路径）
-python3 scripts/plot_kernel_perf.py --csv operators/gemm/bench/20260915145532/gemm_bench.csv
+.venv/bin/python scripts/plot_kernel_perf.py --csv operators/gemm/bench/20260915145532/gemm_bench.csv
 ```
 
 绘图脚本只要求 CSV 含 `label,size,gflops` 三列，后续 softmax / reduce 的扫描结果可用同一脚本绘制；依赖见 `scripts/requirements.txt`（matplotlib、numpy）。
@@ -135,7 +135,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
 
 - [x] 仓库骨架与文档
 - [ ] Softmax：CUDA 核心版本（v0/v1/v2/v3/v4/v5 与 online-v0/v1/v2/v3/v3_false/v4 完成 → Triton 对照）
-- [ ] GEMM：CUDA 核心版本（v0、v1、v2 完成 → 后续优化变体）
+- [ ] GEMM：CUDA 核心版本（v0、v1、v2、v3 完成 → 后续优化变体）
 - [ ] Attention：CUDA 核心版本（v0 → Flash 风格）
 - [x] Reduce：CUDA 核心版本（v0 → v7 优化变体）与验证 / 基准记录   <!-- 入口固定运行 8 个内核 × 2 个正常场景 = 16 项；历史严格基准结论见 operators/reduce/README.md「结论记录」。 -->
 - [ ] Softmax / GEMM / Attention：CUDA 核心版本 → 正确性验证与基准记录

@@ -7,6 +7,12 @@
 
 ### Added
 
+- 2026-09-16 `operators/gemm`：新增并接入共享内存分块 + 寄存器行分块的 SGEMM v3
+  - `include/sgemm_v3.cuh`：新增 `sgemm_v3<32,32,32,8>` 模板内核。一个 block 使用 128 个线程协作装载 A / B 的 `32×32` tile；每线程累加同一列连续 8 行的结果，M/N/K 尾块通过加载补 0 和写回保护覆盖。
+  - `main.cu`：注册 v3（`grid=(ceil(N/32),ceil(M/32))`、`block=(128,1)`、静态共享内存 8 KiB、动态共享内存 0 B），并增加 `--v3-boundary`，用于只验证 `510×514×518` 的非对齐尾块场景。
+  - 验证：Release 构建通过；默认入口 5/5 PASS；v3 边界专项 PASS（`max_err=1.288e-06`）。
+  - 扫描产物：`--bench` 30 点全部成功，CSV / PNG 位于 `operators/gemm/bench/20260916201534/`；512³ v3 为 2170.1 GFLOP/s，约为同场 v2 的 1.93×。
+
 - 2026-09-15 19:30 `operators/gemm`：新增共享内存分块版 SGEMM v2 并接入测试
   - `include/sgemm_v2.cuh`：新增 `sgemm_v2<BLOCKSIZE>` 模板内核（内联在头文件 —— `-rdc=false` 下跨翻译单元引用 `__global__` 模板特化已被 nvcc 弃用）。一个 block 以 `BLOCKSIZE²` 个线性线程覆盖 `BLOCKSIZE×BLOCKSIZE` 输出 tile，k 方向按 tile 把 A / B 搬进静态共享内存（BLOCKSIZE=32 时 8 KiB，动态共享内存仍为 0 B）；M / N 越界线程空转，K 非 BLOCKSIZE 倍数时尾块补 0，K == 0 时输出写 0。启动约束 `block=(BLOCKSIZE²,1)`、`grid=(ceil(M/BLOCKSIZE),ceil(N/BLOCKSIZE))`。
   - 修正写回位置：C 的写回原先放在 k 循环内，512³ / BLOCKSIZE=32 时每线程多写 15 次全量 C（约 15 MB 额外全局写）；移到循环外后只在末尾写一次。
@@ -19,6 +25,9 @@
   - 文档同步：`operators/gemm/README.md`（状态表与规划说明改为共享内存分块、原「v2 向量化 / 每线程多元素」顺延为 v3、结论记录新增 v2 行与含 v2 的多尺寸曲线章节）、根 `README.md`（GEMM 进度改为 v0、v1、v2 完成）。
 
 ### Changed
+
+- 2026-09-16 `scripts`：统一 Python 绘图环境为项目根目录 `.venv/`
+  - `.venv/bin/python` 已安装 `scripts/requirements.txt` 声明的 matplotlib 与 numpy；根 README、GEMM 绘图命令与 `docs/python-environment.md` 记录初始化、更新和调用方式。
 
 - 2026-09-16 10:55 `operators/gemm`：按 `.codebuddy/rules/注释规则.mdc` 整理 gemm 其余代码文件的注释
   - `include/sgemm_v0.cuh` / `src/sgemm_v0.cu`：声明处删去启动约束（block / grid / 0 B 动态共享内存）与 1e-3 容差说明，文件头收敛为「行主序 + 每线程一个输出元素」；函数体补坐标映射行尾注释与 K 方向累加说明。

@@ -14,8 +14,8 @@ __global__ void sgemm_v2(const float* A, const float* B, float* C, const int M, 
 	__shared__ float sharedA[TILE_SIZE * TILE_SIZE];  // A 的当前 k tile
 	__shared__ float sharedB[TILE_SIZE * TILE_SIZE];  // B 的当前 k tile
 
-	const int cRow = blockIdx.x;  // 本 block 的输出 tile 行号
-	const int cCol = blockIdx.y;  // 本 block 的输出 tile 列号
+	const int cRow = blockIdx.y;  // 本 block 的输出 tile 行号
+	const int cCol = blockIdx.x;  // 本 block 的输出 tile 列号
 
 	// 将线性线程索引拆分为 tile 内行列坐标。
 	const int threadRow = threadIdx.x / TILE_SIZE;
