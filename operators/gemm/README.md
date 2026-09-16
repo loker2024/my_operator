@@ -20,7 +20,7 @@
 
 - **v0 朴素**：建立正确性基线，速度不设预期。
 - **v1 全局内存访问合并**：保留 `sgemm_v1<32>` 的原始模板实现；用 `TILE_SIZE² = 1024` 个线性线程覆盖一个 `32×32` 输出 tile，不使用共享内存 —— warp 内 `threadCol` 连续，B 的读取按列连续合并、A 的读取同址广播。启动约束为 `block=(1024,1)`、`grid=(ceil(M/32),ceil(N/32))`、动态共享内存 0 B —— 线程数不足 `TILE_SIZE²` 时每 block 只写出 tile 首行（静默算错的坑，见「结论记录」）。
-- **v2 共享内存分块**：`sgemm_v2<32>` 把 A / B 的 `32×32` tile 搬进共享内存，k 方向按 tile 步进，每线程仍算一个输出元素 —— 全局访存降到 v1 的 1/32。启动约束同 v1：`block=(1024,1)`、`grid=(ceil(M/32),ceil(N/32))`、动态共享内存 0 B（静态共享内存 8 KiB）。`sgemm_v2` 为模板内核，定义内联在 `include/sgemm_v2.cuh`、由 `main.cu` 显式实例化（`-rdc=false` 下跨翻译单元引用 `__global__` 模板特化已被 nvcc 弃用），`src/sgemm_v2.cu` 仅为占位。
+- **v2 共享内存分块**：`sgemm_v2<32>` 把 A / B 的 `32×32` tile 搬进共享内存，k 方向按 tile 步进，每线程仍算一个输出元素 —— 全局访存降到 v1 的 1/32。其二维坐标按 CUDA 常规语义取 `grid.x` 为输出 tile 列、`grid.y` 为输出 tile 行，故启动约束为 `block=(1024,1)`、`grid=(ceil(N/32),ceil(M/32))`、动态共享内存 0 B（静态共享内存 8 KiB）；v1 仍保持 `grid=(ceil(M/32),ceil(N/32))`。`sgemm_v2` 为模板内核，定义内联在 `include/sgemm_v2.cuh`、由 `main.cu` 显式实例化（`-rdc=false` 下跨翻译单元引用 `__global__` 模板特化已被 nvcc 弃用），`src/sgemm_v2.cu` 仅为占位。
 - **v3（顺延）**：在共享内存分块基础上做 `float4` 装载与每线程多元素（寄存器分块）微调，追求寄存器级复用 —— 原 v2 规划。
 - 后续（可选）：考虑仿射对齐 `A^T` 版本、split-K 或更细粒度优化，视学习节奏再定。
 

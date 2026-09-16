@@ -91,6 +91,12 @@
 
 ### Fixed
 
+- 2026-09-16 `operators/gemm`：统一 SGEMM v2 的 block 坐标与 host grid 轴语义
+  - `sgemm_v2` 保持 `cRow = blockIdx.y`、`cCol = blockIdx.x`，即 `grid.y` 覆盖输出 tile 行、`grid.x` 覆盖输出 tile 列。
+  - `main.cu` 的启动配置新增行轴归属；仅 v2 以 `grid=(ceil(N/32),ceil(M/32))` 启动，v0 / v1 继续使用原有 `grid=(ceil(M/tile_rows),ceil(N/tile_cols))` 映射。
+  - `operators/gemm/README.md` 同步 v2 的二维坐标和启动约束；默认快速回归仍仅运行 `512×512×512`。
+  - 非方阵复核：临时使用 `513×511×509`，修复前 v2 有 511 个错误元素；修复后 cuBLAS、v0、v1、v2 均通过，v2 最大相对误差 `1.293e-06`。
+
 - 2026-09-15 13:50 `operators/gemm`：更正 v1 结论并补齐 v1 源码注释
   - 复核：`./build/operators/gemm/gemm` 当前 3/3 PASS，v1 为 `max_err=1.275e-06`、中位 `0.3630 ms` / `0.740 TFLOPS`（同日三次采样 0.3513–0.3811 ms；同场 v0 `1.8651 ms` / `0.144 TFLOPS`、cuBLAS `0.0657 ms` / `4.088 TFLOPS`）—— 2026-09-14 记录的「v1 未通过正确性验证」不再成立。
   - 根因定位：以 `block=(32,1)` 启动能复现与旧记录逐位一致的 `max_err=1.000e+00`、错误元素数 253,952（每 block 只写出 `32×32` tile 首行 → 8192 项正确、253,952 项未写入，未写入区为 0 时相对误差恰为 `1.000e+00`）；v1 的线性索引映射本身正确，故障来自物理 block 未给满 `BLOCKSIZE² = 1024` 个线程。

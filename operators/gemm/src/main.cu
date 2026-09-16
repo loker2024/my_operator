@@ -39,6 +39,7 @@ struct LaunchConfig {
 	int tile_rows;
 	int tile_cols;
 	std::size_t smem_bytes;
+	bool row_uses_grid_y;
 };
 
 // plot_name 用于 --bench 的 CSV 首列与性能曲线图例（保持简短）；description 用于正确性
@@ -54,15 +55,15 @@ const KernelEntry kKernels[] = {
     {"sgemm_v0",
      "sgemm_v0 (one thread per output element, global-memory baseline)",
      reinterpret_cast<const void*>(sgemm_v0),
-     {kBlockX, kBlockY, kBlockX, kBlockY, 0}},
+     {kBlockX, kBlockY, kBlockX, kBlockY, 0, false}},
     {"sgemm_v1",
      "sgemm_v1 (TILE_SIZE=32, original global-memory implementation)",
      reinterpret_cast<const void*>(sgemm_v1<kSgemmV1TileSize>),
-     {kSgemmV1Threads, 1, kSgemmV1TileSize, kSgemmV1TileSize, 0}},
+     {kSgemmV1Threads, 1, kSgemmV1TileSize, kSgemmV1TileSize, 0, false}},
     {"sgemm_v2",
      "sgemm_v2 (TILE_SIZE=32, shared-memory tiling, one thread per output)",
      reinterpret_cast<const void*>(sgemm_v2<kSgemmV2TileSize>),
-     {kSgemmV2Threads, 1, kSgemmV2TileSize, kSgemmV2TileSize, 0}},
+     {kSgemmV2Threads, 1, kSgemmV2TileSize, kSgemmV2TileSize, 0, true}},
 };
 
 struct Scenario {
@@ -107,6 +108,14 @@ struct BenchPoint {
 
 int DivUp(int value, int divisor) {
 	return (value + divisor - 1) / divisor;
+}
+
+int GridX(int M, int N, const LaunchConfig& launch) {
+	return launch.row_uses_grid_y ? DivUp(N, launch.tile_cols) : DivUp(M, launch.tile_rows);
+}
+
+int GridY(int M, int N, const LaunchConfig& launch) {
+	return launch.row_uses_grid_y ? DivUp(M, launch.tile_rows) : DivUp(N, launch.tile_cols);
 }
 
 // 默认 CSV 路径：operators/gemm/bench/<YYYYmmddHHMMSS>/gemm_bench.csv —— 按扫描时刻分目录。
@@ -227,8 +236,8 @@ int RunSweep(const SweepOptions& options) {
 		for (const int size : options.sizes) {
 			int iters = 0;
 			const double median_ms = bench_gemm_kernel(
-			    kernel.kernel, size, size, size, DivUp(size, kernel.launch.tile_rows),
-			    DivUp(size, kernel.launch.tile_cols), kernel.launch.block_x, kernel.launch.block_y,
+			    kernel.kernel, size, size, size, GridX(size, size, kernel.launch),
+			    GridY(size, size, kernel.launch), kernel.launch.block_x, kernel.launch.block_y,
 			    kernel.launch.smem_bytes, options.warmup, options.budget_ms, &iters);
 			RecordPoint(&points, kernel.plot_name, size, median_ms, iters);
 		}
@@ -266,11 +275,11 @@ int RunValidation() {
 		for (const Scenario& scenario : kNormalScenarios) {
 			char name[192];
 			std::snprintf(name, sizeof(name), "%s | %s", kernel.description, scenario.label);
-			const bool ok =
-			    test_gemm_kernel(kernel.kernel, name, scenario.M, scenario.N, scenario.K,
-			                     DivUp(scenario.M, kernel.launch.tile_rows),
-			                     DivUp(scenario.N, kernel.launch.tile_cols), kernel.launch.block_x,
-			                     kernel.launch.block_y, kernel.launch.smem_bytes);
+			const bool ok = test_gemm_kernel(
+			    kernel.kernel, name, scenario.M, scenario.N, scenario.K,
+			    GridX(scenario.M, scenario.N, kernel.launch),
+			    GridY(scenario.M, scenario.N, kernel.launch), kernel.launch.block_x,
+			    kernel.launch.block_y, kernel.launch.smem_bytes);
 			all_ok = all_ok && ok;
 			passed += ok ? 1 : 0;
 			++total;
