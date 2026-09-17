@@ -1,67 +1,53 @@
 #pragma once
-// sgemm_v3.cuh —— SGEMM v3 共享内存分块与寄存器行分块模板内核。
+// sgemm_v3_user_previous.cuh —— 保留的用户原始 SGEMM v3 实现，不由运行入口包含。
 
 #include <cuda_runtime.h>
 
-template <int BM, int BN, int BK, int TM>
-__global__ void sgemm_v3(const float* A, const float* B, float* C, const int M, const int N,
-                         const int K) {
-	static_assert(BM % TM == 0, "TM must divide BM");
-	constexpr int kThreads = BM * BN / TM;
+#include <cassert>
 
-	__shared__ float sharedA[BM * BK];  // A 的当前 k tile
-	__shared__ float sharedB[BK * BN];  // B 的当前 k tile
+template <const int BM, const int BN, const int BK, const int TM>
+__global__ void sgemm_v3_user_previous(const float* A, const float* B, float* C, const int M,
+                                       const int N, const int K) {
+	__shared__ float sharedA[BM * BK];
+	__shared__ float sharedB[BN * BK];
 
-	const int tid = threadIdx.x;
-	const int block_row = blockIdx.y * BM;
-	const int block_col = blockIdx.x * BN;
-	const int thread_row_base = (tid / BN) * TM;
-	const int thread_col = tid % BN;
-	float thread_results[TM] = {};
+	const int cRow = blockIdx.y;
+	const int cCol = blockIdx.x;
 
-	if (blockDim.x != kThreads) return;
+	const int threadRow = threadIdx.x / BN;
+	const int threadCol = threadIdx.x % BN;
 
-	for (int k_base = 0; k_base < K; k_base += BK) {
-		// 协作装载 A 的当前 k tile，越界元素补 0。
-		for (int index = tid; index < BM * BK; index += kThreads) {
-			const int row = index / BK;
-			const int col = index % BK;
-			const int global_row = block_row + row;
-			const int global_col = k_base + col;
-			sharedA[index] =
-			    (global_row < M && global_col < K) ? A[global_row * K + global_col] : 0.0f;
-		}
+	A += cRow * BM * K;
+	B += cCol * BN;
+	C += cRow * BM * N + cCol * BN;
 
-		// 协作装载 B 的当前 k tile，越界元素补 0。
-		for (int index = tid; index < BK * BN; index += kThreads) {
-			const int row = index / BN;
-			const int col = index % BN;
-			const int global_row = k_base + row;
-			const int global_col = block_col + col;
-			sharedB[index] =
-			    (global_row < K && global_col < N) ? B[global_row * N + global_col] : 0.0f;
-		}
+	assert(BM * BK == blockDim.x);
+	assert(BK * BN == blockDim.x);
+
+	const int innerRowA = threadIdx.x / BK;
+	const int innerColA = threadIdx.x % BK;
+	const int innerRowB = threadIdx.x / BN;
+	const int innerColB = threadIdx.x % BN;
+
+	float threadResults[TM] = {0.0};
+
+	for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+		sharedA[innerRowA * BK + innerColA] = A[innerRowA * K + innerColA];
+		sharedB[innerRowB * BN + innerColB] = B[innerRowB * N + innerColB];
+
 		__syncthreads();
+		A += BK;
+		B += BK * N;
 
-		// 累加当前线程负责的 TM 个输出行。
-		for (int k = 0; k < BK; ++k) {
-			const float b_value = sharedB[k * BN + thread_col];
-#pragma unroll
-			for (int row_offset = 0; row_offset < TM; ++row_offset) {
-				thread_results[row_offset] +=
-				    sharedA[(thread_row_base + row_offset) * BK + k] * b_value;
+		for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+			const float tmpB = sharedB[dotIdx * BN + threadCol];
+			for (int resIdx = 0; resIdx < TM; ++resIdx) {
+				threadResults[resIdx] += sharedA[(threadRow * TM + resIdx) * BK + dotIdx] * tmpB;
 			}
 		}
 		__syncthreads();
 	}
-
-	// 将合法范围内的 TM 个输出元素写回全局内存。
-#pragma unroll
-	for (int row_offset = 0; row_offset < TM; ++row_offset) {
-		const int global_row = block_row + thread_row_base + row_offset;
-		const int global_col = block_col + thread_col;
-		if (global_row < M && global_col < N) {
-			C[global_row * N + global_col] = thread_results[row_offset];
-		}
+	for (int resIdx = 0; resIdx < TM; ++resIdx) {
+		C[(threadRow * TM + resIdx) * N + threadCol] = threadResults[resIdx];
 	}
 }
