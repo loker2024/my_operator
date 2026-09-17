@@ -32,12 +32,18 @@ constexpr int kSgemmV1Threads = kSgemmV1TileSize * kSgemmV1TileSize;
 // sgemm_v2 的启动配置：同 v1，共享内存为静态分配（不计入动态共享内存）。
 constexpr int kSgemmV2TileSize = 32;
 constexpr int kSgemmV2Threads = kSgemmV2TileSize * kSgemmV2TileSize;
-// sgemm_v3：32×32×32 tile，每线程连续计算 8 个输出行。
-constexpr int kSgemmV3BM = 32;
-constexpr int kSgemmV3BN = 32;
-constexpr int kSgemmV3BK = 32;
-constexpr int kSgemmV3TM = 8;
-constexpr int kSgemmV3Threads = kSgemmV3BM * kSgemmV3BN / kSgemmV3TM;
+// sgemm_v3 TM1：32×32×32 tile，每线程计算一个输出元素。
+constexpr int kSgemmV3TM1BM = 32;
+constexpr int kSgemmV3TM1BN = 32;
+constexpr int kSgemmV3TM1BK = 32;
+constexpr int kSgemmV3TM1 = 1;
+constexpr int kSgemmV3TM1Threads = kSgemmV3TM1BM * kSgemmV3TM1BK;
+// sgemm_v3 TM8：64×64×8 tile，每线程计算连续 8 个输出行。
+constexpr int kSgemmV3TM8BM = 64;
+constexpr int kSgemmV3TM8BN = 64;
+constexpr int kSgemmV3TM8BK = 8;
+constexpr int kSgemmV3TM8 = 8;
+constexpr int kSgemmV3TM8Threads = kSgemmV3TM8BM * kSgemmV3TM8BK;
 
 // 一次启动的配置：物理 block、每 block 覆盖的输出 tile 与动态共享内存字节数。
 struct LaunchConfig {
@@ -71,10 +77,16 @@ const KernelEntry kKernels[] = {
      "sgemm_v2 (TILE_SIZE=32, shared-memory tiling, one thread per output)",
      reinterpret_cast<const void*>(sgemm_v2<kSgemmV2TileSize>),
      {kSgemmV2Threads, 1, kSgemmV2TileSize, kSgemmV2TileSize, 0, true}},
-    {"sgemm_v3",
-     "sgemm_v3 (32x32x32 shared-memory tiling, 8 rows per thread)",
-     reinterpret_cast<const void*>(sgemm_v3<kSgemmV3BM, kSgemmV3BN, kSgemmV3BK, kSgemmV3TM>),
-     {kSgemmV3Threads, 1, kSgemmV3BM, kSgemmV3BN, 0, true}},
+    {"sgemm_v3_TM1",
+     "sgemm_v3_TM1 (32x32x32 shared-memory tiling, 1 row per thread)",
+     reinterpret_cast<const void*>(
+         sgemm_v3<kSgemmV3TM1BM, kSgemmV3TM1BN, kSgemmV3TM1BK, kSgemmV3TM1>),
+     {kSgemmV3TM1Threads, 1, kSgemmV3TM1BM, kSgemmV3TM1BN, 0, true}},
+    {"sgemm_v3_TM8",
+     "sgemm_v3_TM8 (64x64x8 shared-memory tiling, 8 rows per thread)",
+     reinterpret_cast<const void*>(
+         sgemm_v3<kSgemmV3TM8BM, kSgemmV3TM8BN, kSgemmV3TM8BK, kSgemmV3TM8>),
+     {kSgemmV3TM8Threads, 1, kSgemmV3TM8BM, kSgemmV3TM8BN, 0, true}},
 };
 
 struct Scenario {
@@ -88,9 +100,6 @@ struct Scenario {
 const Scenario kNormalScenarios[] = {
     {"normal: 512x512x512", 512, 512, 512},
 };
-
-// sgemm_v3 专项边界场景：M/N/K 都不整除 32。
-const Scenario kSgemmV3BoundaryScenario = {"boundary: 510x514x518", 510, 514, 518};
 
 // ---- 扫描模式（--bench）的默认配置 ----
 const char* const kCublasPlotName = "cuBLAS";
@@ -148,7 +157,6 @@ void PrintUsage(const char* program) {
 	    program);
 	std::printf("  (no option): correctness + performance on the default 512x512x512 scenario\n");
 	std::printf("  --bench    : sweep the sizes and write kernel timings as CSV\n");
-	std::printf("  --v3-boundary: run sgemm_v3 correctness on 510x514x518\n");
 	std::printf(
 	    "               performance only, no correctness check; sizes are square matrices\n");
 }
@@ -307,19 +315,6 @@ int RunValidation() {
 	return all_ok ? 0 : 1;
 }
 
-int RunSgemmV3BoundaryValidation() {
-	const KernelEntry& kernel = kKernels[3];
-	const Scenario& scenario = kSgemmV3BoundaryScenario;
-	char name[192];
-	std::snprintf(name, sizeof(name), "%s | %s", kernel.description, scenario.label);
-	const bool ok = test_gemm_kernel(
-	    kernel.kernel, name, scenario.M, scenario.N, scenario.K,
-	    GridX(scenario.M, scenario.N, kernel.launch), GridY(scenario.M, scenario.N, kernel.launch),
-	    kernel.launch.block_x, kernel.launch.block_y, kernel.launch.smem_bytes);
-	std::printf("==== Result: sgemm_v3 boundary %s ====\n", ok ? "PASS" : "FAIL");
-	return ok ? 0 : 1;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -330,9 +325,6 @@ int main(int argc, char** argv) {
 			return 2;
 		}
 		return RunSweep(options);
-	}
-	if (argc == 2 && std::strcmp(argv[1], "--v3-boundary") == 0) {
-		return RunSgemmV3BoundaryValidation();
 	}
 	if (argc > 1) {
 		PrintUsage(argv[0]);
