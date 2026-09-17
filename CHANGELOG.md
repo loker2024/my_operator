@@ -7,6 +7,14 @@
 
 ### Added
 
+- 2026-09-17 13:50 `operators/gemm`：新增二维线程分块版 SGEMM v4 并接入测试
+  - `include/sgemm_v4.cuh`：新增 `sgemm_v4<BM,BN,BK,TM,TN>` 模板内核（内联在头文件，由 `main.cu` 显式实例化）。一个 block 以 `BM×BN/(TM×TN)` 个线程覆盖 `BM×BN` 输出 tile，`BM×BK` 与 `BK×BN` 两个共享内存 tile 分趟装载，每线程在寄存器里累加 `TM×TN` 个输出；默认实参 `<64,64,8,4,4>`、`block=(256,1)`、静态共享内存 4 KiB、动态共享内存 0 B，M / N / K 须分别为 BM / BN / BK 的倍数（与 v3 一致，无尾块保护）。
+  - 修正初版 B tile 装载循环的上界：原为 `loadOffset < BN`，会越界写共享内存、并在最后一个 k tile 越界读全局内存，512³ 回归直接触发 `cudaErrorIllegalAddress`；改为 `loadOffset < BK`（步长 `blockDim.x/BN`）后恰好覆盖 BK 行。
+  - 补齐注释：文件头说明、模板启动契约（`blockDim.x` 与两条整除约束、形状对齐要求）、装载 / 计算 / 写回各阶段的「做什么」注释；缩进改为 Tab 并通过对 `.clang-format` 的检查。
+  - `main.cu`：包含 `sgemm_v4.cuh` 并以 `<64,64,8,4,4>` 注册进 `kKernels`；默认回归场景由单场景 `512×512×512` 扩为 `512×512×512` 与 `512×256×128`（非方阵，用于覆盖 `blockIdx` 的行列映射），入口头部改打印实际场景数。
+  - 验证：默认入口 14/14 PASS；v4 在 512³ 为 `max_err=1.275e-06`、中位 `0.0608 ms` / `4.412 TFLOPS`，在 512×256×128 为 `max_err=6.805e-07`、`0.0201 ms` / `1.670 TFLOPS`；同场 cuBLAS 512³ `0.0541 ms` / `4.964 TFLOPS`、v3 TM8 `0.0937 ms` / `2.865 TFLOPS`、v2 `0.2628 ms` / `1.022 TFLOPS`。
+  - 扫描产物：`--bench` 42 点全部成功，CSV / PNG 位于 `operators/gemm/bench/20260917135054/`；v4 相对 v3 TM8 在 512³ / 1024³ / 2048³ / 4096³ 为 1.28× / 1.51× / 1.40× / 1.41×，1024³ 达 cuBLAS 的 81.1%。
+  - 文档同步：`operators/gemm/README.md`（状态表新增 v4 行、规划说明补 v4 条目与越界结论、回归口径改为两个场景、结论记录新增 v4 采样与含 v4 的多尺寸曲线章节）、根 `README.md`（GEMM 进度改为 v0、v1、v2、v3、v4 完成）。
 - 2026-09-15 19:30 `operators/gemm`：新增共享内存分块版 SGEMM v2 并接入测试
   - `include/sgemm_v2.cuh`：新增 `sgemm_v2<BLOCKSIZE>` 模板内核（内联在头文件 —— `-rdc=false` 下跨翻译单元引用 `__global__` 模板特化已被 nvcc 弃用）。一个 block 以 `BLOCKSIZE²` 个线性线程覆盖 `BLOCKSIZE×BLOCKSIZE` 输出 tile，k 方向按 tile 把 A / B 搬进静态共享内存（BLOCKSIZE=32 时 8 KiB，动态共享内存仍为 0 B）；M / N 越界线程空转，K 非 BLOCKSIZE 倍数时尾块补 0，K == 0 时输出写 0。启动约束 `block=(BLOCKSIZE²,1)`、`grid=(ceil(M/BLOCKSIZE),ceil(N/BLOCKSIZE))`。
   - 修正写回位置：C 的写回原先放在 k 循环内，512³ / BLOCKSIZE=32 时每线程多写 15 次全量 C（约 15 MB 额外全局写）；移到循环外后只在末尾写一次。

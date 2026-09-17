@@ -19,6 +19,7 @@
 #include "include/sgemm_v1.cuh"
 #include "include/sgemm_v2.cuh"
 #include "include/sgemm_v3.cuh"
+#include "include/sgemm_v4.cuh"
 #include "include/test.cuh"
 
 namespace {
@@ -44,6 +45,13 @@ constexpr int kSgemmV3TM8BN = 64;
 constexpr int kSgemmV3TM8BK = 8;
 constexpr int kSgemmV3TM8 = 8;
 constexpr int kSgemmV3TM8Threads = kSgemmV3TM8BM * kSgemmV3TM8BK;
+// sgemm_v4 的启动配置：64×64 输出 tile、BK=8，每线程算 4×4 个输出元素，block=(256,1)。
+constexpr int kSgemmV4BM = 64;
+constexpr int kSgemmV4BN = 64;
+constexpr int kSgemmV4BK = 8;
+constexpr int kSgemmV4TM = 4;
+constexpr int kSgemmV4TN = 4;
+constexpr int kSgemmV4Threads = kSgemmV4BM * kSgemmV4BN / (kSgemmV4TM * kSgemmV4TN);
 
 // 一次启动的配置：物理 block、每 block 覆盖的输出 tile 与动态共享内存字节数。
 struct LaunchConfig {
@@ -87,6 +95,11 @@ const KernelEntry kKernels[] = {
      reinterpret_cast<const void*>(
          sgemm_v3<kSgemmV3TM8BM, kSgemmV3TM8BN, kSgemmV3TM8BK, kSgemmV3TM8>),
      {kSgemmV3TM8Threads, 1, kSgemmV3TM8BM, kSgemmV3TM8BN, 0, true}},
+    {"sgemm_v4",
+     "sgemm_v4 (64x64x8 shared-memory tiling, 4x4 outputs per thread)",
+     reinterpret_cast<const void*>(
+         sgemm_v4<kSgemmV4BM, kSgemmV4BN, kSgemmV4BK, kSgemmV4TM, kSgemmV4TN>),
+     {kSgemmV4Threads, 1, kSgemmV4BM, kSgemmV4BN, 0, true}},
 };
 
 struct Scenario {
@@ -96,9 +109,11 @@ struct Scenario {
 	int K;
 };
 
-// 固定的正常测试场景：每个内核和 cuBLAS 对照只运行一次。
+// 固定的正常测试场景：每个内核和 cuBLAS 对照各运行一次；512×256×128 为非方阵，用于覆盖
+// blockIdx 的行列映射（各内核的 tile 边长均能整除该形状）。
 const Scenario kNormalScenarios[] = {
     {"normal: 512x512x512", 512, 512, 512},
+    {"normal non-square: 512x256x128", 512, 256, 128},
 };
 
 // ---- 扫描模式（--bench）的默认配置 ----
@@ -278,7 +293,8 @@ int RunSweep(const SweepOptions& options) {
 int RunValidation() {
 	std::printf("==== GEMM test: correctness (tolerance 1e-3) + performance ====\n");
 	std::printf("kernels under test = %zu\n", sizeof(kKernels) / sizeof(kKernels[0]));
-	std::printf("scenario: 512x512x512\n");
+	std::printf("scenarios: %zu (each kernel runs all of them)\n",
+	            sizeof(kNormalScenarios) / sizeof(kNormalScenarios[0]));
 	std::printf("sampling: 1 warmup + 100 iterations\n\n");
 
 	bool all_ok = true;
